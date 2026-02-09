@@ -29,6 +29,9 @@ config :swoosh, :api_client, false
 # API token for tests
 config :mxc, :api_token, "test-token"
 
+# Don't start Agent supervisor in tests (erlexec, auto-registration)
+config :mxc, :start_agent, false
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

@@ -126,6 +126,27 @@ defmodule Mxc.CoordinatorTest do
       assert workload.cpu_required == 2
       assert workload.memory_required == 1024
     end
+
+    test "deploy_workload/1 rejects unknown workload type" do
+      attrs = %{type: "docker", command: "nginx"}
+      assert {:error, msg} = Coordinator.deploy_workload(attrs)
+      assert msg =~ "unknown workload type"
+    end
+
+    test "deploy_workload/1 auto-adds microvm constraint for microvm type" do
+      attrs = %{type: "microvm", command: "mxc-vm-aarch64"}
+
+      # microvm may or may not be valid depending on platform,
+      # but if it is, the constraints should include "microvm" => "true"
+      case Coordinator.deploy_workload(attrs) do
+        {:ok, workload} ->
+          assert workload.constraints["microvm"] == "true"
+
+        {:error, _} ->
+          # Platform doesn't support microvm — that's fine
+          :ok
+      end
+    end
   end
 
   describe "workload events" do

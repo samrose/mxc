@@ -2,8 +2,11 @@ defmodule Mxc.Agent.Health do
   @moduledoc """
   Reports agent health and resource availability to the coordinator.
 
-  Periodically sends heartbeats with resource usage to the coordinator
-  via RPC, which writes to Postgres and syncs to the FactStore.
+  On startup, auto-registers the local machine as a node if running
+  in standalone mode (or if configured with a node_id in agent mode).
+
+  Periodically sends heartbeats with resource usage. In standalone mode,
+  calls the Coordinator context directly. In agent mode, uses RPC.
   """
 
   use GenServer
@@ -29,14 +32,17 @@ defmodule Mxc.Agent.Health do
 
   @impl true
   def init(_opts) do
-    schedule_heartbeat()
-
     state = %{
       node_id: Application.get_env(:mxc, :node_id),
       cpu_cores: detect_cpu_cores(),
       memory_mb: detect_memory_mb(),
-      hypervisor: Application.get_env(:mxc, :hypervisor)
+      hypervisor: detect_hypervisor()
     }
+
+    # Auto-register in standalone mode
+    state = maybe_auto_register(state)
+
+    schedule_heartbeat()
 
     {:ok, state}
   end
@@ -66,10 +72,64 @@ defmodule Mxc.Agent.Health do
     {:noreply, state}
   end
 
-  # Private Functions
+  # Private
 
   defp schedule_heartbeat do
     Process.send_after(self(), :heartbeat, @heartbeat_interval_ms)
+  end
+
+  defp maybe_auto_register(state) do
+    mode = Application.get_env(:mxc, :mode, :standalone)
+
+    case {mode, state.node_id} do
+      {:standalone, nil} ->
+        # Auto-register this machine as a node
+        hostname = detect_hostname()
+        capabilities = Mxc.Platform.node_capabilities()
+
+        attrs = %{
+          hostname: hostname,
+          status: "available",
+          cpu_total: state.cpu_cores,
+          memory_total: state.memory_mb,
+          cpu_used: 0,
+          memory_used: 0,
+          hypervisor: hypervisor_string(state.hypervisor),
+          capabilities: capabilities
+        }
+
+        case Mxc.Coordinator.create_node(attrs) do
+          {:ok, node} ->
+            Logger.info("Auto-registered local node: #{node.id} (#{hostname})")
+            Application.put_env(:mxc, :node_id, node.id)
+            %{state | node_id: node.id}
+
+          {:error, %Ecto.Changeset{} = cs} ->
+            # Might already exist (duplicate hostname) — find it
+            case find_existing_node(hostname) do
+              {:ok, node} ->
+                Logger.info("Found existing node registration: #{node.id} (#{hostname})")
+                Application.put_env(:mxc, :node_id, node.id)
+                %{state | node_id: node.id}
+
+              :not_found ->
+                Logger.error("Failed to register node: #{inspect(cs.errors)}")
+                state
+            end
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp find_existing_node(hostname) do
+    Mxc.Coordinator.list_nodes()
+    |> Enum.find(fn n -> n.hostname == hostname end)
+    |> case do
+      nil -> :not_found
+      node -> {:ok, node}
+    end
   end
 
   defp report_to_coordinator(state) do
@@ -79,30 +139,42 @@ defmodule Mxc.Agent.Health do
 
       node_id ->
         status = build_status(state)
+        mode = Application.get_env(:mxc, :mode, :standalone)
 
         attrs = %{
-          cpu_used: status.cpu_cores - status.available_cpu,
-          memory_used: status.memory_mb - status.available_memory_mb,
+          cpu_used: state.cpu_cores - status.available_cpu,
+          memory_used: state.memory_mb - status.available_memory_mb,
           status: "available"
         }
 
-        case find_coordinator_node() do
-          nil ->
-            Logger.debug("No coordinator node found, skipping heartbeat")
-
-          coordinator ->
-            case :rpc.call(coordinator, Mxc.Coordinator, :heartbeat_node, [node_id, attrs]) do
-              {:ok, _node} ->
-                :ok
-
+        case mode do
+          m when m in [:standalone, :coordinator] ->
+            # Same BEAM node — call directly
+            case Mxc.Coordinator.heartbeat_node(node_id, attrs) do
+              {:ok, _node} -> :ok
               {:error, :not_found} ->
-                Logger.warning("Node #{node_id} not registered on coordinator, cannot heartbeat")
-
-              {:badrpc, reason} ->
-                Logger.debug("RPC to coordinator failed: #{inspect(reason)}")
-
+                Logger.warning("Node #{node_id} not found, re-registering")
+                # Node was deleted, clear node_id so next tick re-registers
               other ->
                 Logger.debug("Heartbeat result: #{inspect(other)}")
+            end
+
+          :agent ->
+            # Distributed — RPC to coordinator
+            case find_coordinator_node() do
+              nil ->
+                Logger.debug("No coordinator node found, skipping heartbeat")
+
+              coordinator ->
+                case :rpc.call(coordinator, Mxc.Coordinator, :heartbeat_node, [node_id, attrs]) do
+                  {:ok, _node} -> :ok
+                  {:error, :not_found} ->
+                    Logger.warning("Node #{node_id} not registered on coordinator")
+                  {:badrpc, reason} ->
+                    Logger.debug("RPC to coordinator failed: #{inspect(reason)}")
+                  other ->
+                    Logger.debug("Heartbeat result: #{inspect(other)}")
+                end
             end
         end
     end
@@ -131,8 +203,8 @@ defmodule Mxc.Agent.Health do
   defp calculate_resource_usage(workloads) do
     Enum.reduce(workloads, {0, 0}, fn w, {cpu, mem} ->
       {
-        cpu + (w.spec[:cpu] || 0),
-        mem + (w.spec[:memory_mb] || 0)
+        cpu + (w[:cpu_required] || 0),
+        mem + (w[:memory_required] || 0)
       }
     end)
   end
@@ -143,6 +215,23 @@ defmodule Mxc.Agent.Health do
       node |> Atom.to_string() |> String.starts_with?("coordinator@")
     end)
   end
+
+  defp detect_hostname do
+    {:ok, hostname} = :inet.gethostname()
+    to_string(hostname)
+  end
+
+  defp detect_hypervisor do
+    # Use configured value or auto-detect
+    case Application.get_env(:mxc, :hypervisor) do
+      nil -> Mxc.Platform.preferred_hypervisor()
+      hv when is_atom(hv) -> hv
+      hv when is_binary(hv) -> String.to_atom(hv)
+    end
+  end
+
+  defp hypervisor_string(nil), do: nil
+  defp hypervisor_string(hv), do: to_string(hv)
 
   defp detect_cpu_cores do
     case Application.get_env(:mxc, :cpu_cores, 0) do

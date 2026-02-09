@@ -28,7 +28,7 @@ defmodule Mxc.MixProject do
           Mxc.Agent,
           Mxc.Agent.Executor,
           Mxc.Agent.Health,
-          Mxc.Agent.VMManager,
+          Mxc.Agent.MicroVM,
           Mxc.Agent.Supervisor,
           # Phoenix boilerplate
           MxcWeb.CoreComponents,

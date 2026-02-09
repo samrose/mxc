@@ -47,11 +47,20 @@ defmodule Mxc.Application do
     # Development mode - run everything
     ui_enabled = Application.get_env(:mxc, :ui_enabled, true)
 
-    [
+    base = [
       Mxc.Repo,
-      Mxc.Coordinator.Supervisor,
-      Mxc.Agent.Supervisor
-    ] ++ web_children(ui_enabled)
+      Mxc.Coordinator.Supervisor
+    ]
+
+    # Don't start Agent in test (Executor needs erlexec, Health auto-registers)
+    agent =
+      if Application.get_env(:mxc, :start_agent, true) do
+        [Mxc.Agent.Supervisor]
+      else
+        []
+      end
+
+    base ++ agent ++ web_children(ui_enabled)
   end
 
   defp web_children(true) do

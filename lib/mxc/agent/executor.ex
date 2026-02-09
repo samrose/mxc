@@ -1,16 +1,20 @@
 defmodule Mxc.Agent.Executor do
   @moduledoc """
-  Executes and manages workloads on the local node.
+  Executes and manages workloads on the local machine.
 
-  Supports two types of workloads:
-  - :process - System processes managed via erlexec
-  - :microvm - MicroVMs managed via the configured hypervisor
+  Accepts Ecto Workload structs from the Coordinator (via Dispatcher)
+  and runs them:
+  - "process" type: system processes managed via erlexec
+  - "microvm" type: NixOS microVMs managed via Mxc.Agent.MicroVM
+
+  Reports status changes back to the Coordinator.
   """
 
   use GenServer
   require Logger
 
-  alias Mxc.Agent.VMManager
+  alias Mxc.Agent.MicroVM
+  alias Mxc.Coordinator.Schemas.Workload
 
   # Client API
 
@@ -19,14 +23,15 @@ defmodule Mxc.Agent.Executor do
   end
 
   @doc """
-  Starts a workload based on its specification.
+  Starts a workload. Accepts an Ecto Workload struct.
+  Returns :ok or {:error, reason}.
   """
-  def start_workload(workload) do
-    GenServer.call(__MODULE__, {:start_workload, workload}, 30_000)
+  def start_workload(%Workload{} = workload) do
+    GenServer.call(__MODULE__, {:start_workload, workload}, 60_000)
   end
 
   @doc """
-  Stops a running workload.
+  Stops a running workload by ID.
   """
   def stop_workload(workload_id) do
     GenServer.call(__MODULE__, {:stop_workload, workload_id})
@@ -50,44 +55,70 @@ defmodule Mxc.Agent.Executor do
 
   @impl true
   def init(_opts) do
-    # Start erlexec port program
-    :exec.start([])
+    # Start erlexec port program for process workloads
+    case :exec.start([]) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _}} -> :ok
+    end
 
     {:ok, %{workloads: %{}}}
   end
 
   @impl true
-  def handle_call({:start_workload, workload}, _from, state) do
-    spec = workload.spec
+  def handle_call({:start_workload, %Workload{} = workload}, _from, state) do
+    case workload.type do
+      "microvm" ->
+        # MicroVM builds can take minutes — launch async and reply immediately.
+        # The spawned task sends {:microvm_started, ...} or {:microvm_failed, ...}
+        # back to this GenServer when done.
+        executor_pid = self()
 
-    result =
-      case workload.type do
-        :process -> start_process(workload.id, spec)
-        :microvm -> start_microvm(workload.id, spec)
-        _ -> {:error, :unknown_workload_type}
-      end
+        spawn(fn ->
+          try do
+            Logger.info("MicroVM build starting for #{workload.id}: #{workload.command}")
+            result = start_microvm(workload)
+            Logger.info("MicroVM build result for #{workload.id}: #{inspect(result)}")
 
-    case result do
-      {:ok, local_state} ->
-        Logger.info("Started workload #{workload.id}: #{inspect(spec[:command] || spec[:name])}")
+            case result do
+              {:ok, local_state} ->
+                send(executor_pid, {:microvm_started, workload, local_state})
 
-        workload_entry = %{
+              {:error, reason} ->
+                send(executor_pid, {:microvm_failed, workload, reason})
+            end
+          rescue
+            e ->
+              Logger.error("MicroVM build crashed for #{workload.id}: #{Exception.message(e)}")
+              send(executor_pid, {:microvm_failed, workload, Exception.message(e)})
+          catch
+            kind, reason ->
+              Logger.error("MicroVM build error for #{workload.id}: #{kind} #{inspect(reason)}")
+              send(executor_pid, {:microvm_failed, workload, inspect({kind, reason})})
+          end
+        end)
+
+        # Track as building so we know it's in progress
+        entry = %{
           id: workload.id,
           type: workload.type,
-          spec: spec,
-          local_state: local_state,
-          started_at: DateTime.utc_now()
+          command: workload.command,
+          local_state: %{kind: :microvm, status: :building},
+          started_at: nil,
+          cpu_required: workload.cpu_required,
+          memory_required: workload.memory_required
         }
 
-        # Notify coordinator that workload is running
-        notify_coordinator(workload.id, :running)
+        {:reply, :ok, put_in(state.workloads[workload.id], entry)}
 
-        new_state = put_in(state.workloads[workload.id], workload_entry)
-        {:reply, :ok, new_state}
+      type when type in ["process"] ->
+        # Process starts are fast — handle synchronously
+        result = start_process(workload)
+        handle_sync_start_result(workload, result, state)
 
-      {:error, reason} = error ->
-        Logger.error("Failed to start workload #{workload.id}: #{inspect(reason)}")
-        notify_coordinator(workload.id, :failed, %{error: inspect(reason)})
+      other ->
+        error = {:error, {:unknown_workload_type, other}}
+        Logger.error("Failed to start workload #{workload.id}: unknown type #{other}")
+        notify_coordinator(workload.id, "failed", %{error: "unknown workload type: #{other}"})
         {:reply, error, state}
     end
   end
@@ -98,17 +129,17 @@ defmodule Mxc.Agent.Executor do
       nil ->
         {:reply, {:error, :not_found}, state}
 
-      workload ->
+      entry ->
         stop_result =
-          case workload.type do
-            :process -> stop_process(workload.local_state)
-            :microvm -> stop_microvm(workload.local_state)
+          case entry.type do
+            "process" -> stop_process(entry.local_state)
+            "microvm" -> MicroVM.stop_vm(entry.local_state)
           end
 
         case stop_result do
           :ok ->
             Logger.info("Stopped workload #{workload_id}")
-            notify_coordinator(workload_id, :stopped)
+            notify_coordinator(workload_id, "stopped", %{stopped_at: DateTime.utc_now()})
             {:reply, :ok, %{state | workloads: Map.delete(state.workloads, workload_id)}}
 
           {:error, reason} = error ->
@@ -127,8 +158,10 @@ defmodule Mxc.Agent.Executor do
         %{
           id: w.id,
           type: w.type,
-          spec: w.spec,
-          started_at: w.started_at
+          command: w.command,
+          started_at: w.started_at,
+          cpu_required: w.cpu_required,
+          memory_required: w.memory_required
         }
       end)
 
@@ -139,42 +172,54 @@ defmodule Mxc.Agent.Executor do
   def handle_call({:get_workload, workload_id}, _from, state) do
     case Map.get(state.workloads, workload_id) do
       nil -> {:reply, {:error, :not_found}, state}
-      workload -> {:reply, {:ok, workload}, state}
+      entry -> {:reply, {:ok, entry}, state}
     end
   end
 
   @impl true
-  def handle_cast({:stop_workload, workload_id}, state) do
-    # Async version for coordinator requests
-    case Map.get(state.workloads, workload_id) do
-      nil ->
-        {:noreply, state}
+  def handle_info({:microvm_started, workload, local_state}, state) do
+    Logger.info("MicroVM workload #{workload.id} started: #{workload.command}")
 
-      workload ->
-        case workload.type do
-          :process -> stop_process(workload.local_state)
-          :microvm -> stop_microvm(workload.local_state)
-        end
+    # Monitor the VM process so we detect exit
+    if local_state[:pid], do: Process.monitor(local_state[:pid])
 
-        notify_coordinator(workload_id, :stopped)
-        {:noreply, %{state | workloads: Map.delete(state.workloads, workload_id)}}
-    end
+    entry = %{
+      id: workload.id,
+      type: workload.type,
+      command: workload.command,
+      local_state: Map.put(local_state, :kind, :microvm),
+      started_at: DateTime.utc_now(),
+      cpu_required: workload.cpu_required,
+      memory_required: workload.memory_required
+    }
+
+    notify_coordinator(workload.id, "running", %{started_at: DateTime.utc_now()})
+    {:noreply, put_in(state.workloads[workload.id], entry)}
+  end
+
+  @impl true
+  def handle_info({:microvm_failed, workload, reason}, state) do
+    Logger.error("MicroVM workload #{workload.id} failed: #{inspect(reason)}")
+    notify_coordinator(workload.id, "failed", %{error: inspect(reason)})
+    {:noreply, %{state | workloads: Map.delete(state.workloads, workload.id)}}
   end
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
-    # Handle process termination
     case find_workload_by_pid(state.workloads, pid) do
       nil ->
         {:noreply, state}
 
-      {workload_id, _workload} ->
+      {workload_id, _entry} ->
         Logger.warning("Workload #{workload_id} exited: #{inspect(reason)}")
 
-        status = if reason == :normal, do: :stopped, else: :failed
+        status = if reason == :normal, do: "stopped", else: "failed"
         error = if reason != :normal, do: inspect(reason), else: nil
 
-        notify_coordinator(workload_id, status, %{error: error})
+        notify_coordinator(workload_id, status, %{
+          error: error,
+          stopped_at: DateTime.utc_now()
+        })
 
         {:noreply, %{state | workloads: Map.delete(state.workloads, workload_id)}}
     end
@@ -198,40 +243,38 @@ defmodule Mxc.Agent.Executor do
     {:noreply, state}
   end
 
-  # Private Functions
+  # Private — Process workloads
 
-  defp start_process(_workload_id, spec) do
-    command = spec[:command] || raise "Process workload requires :command"
-    args = spec[:args] || []
-    env = spec[:env] || []
-    cwd = spec[:cwd] || "/tmp"
+  defp start_process(%Workload{} = workload) do
+    command = workload.command || raise "process workload requires a command"
+    args = workload.args || []
 
     full_command =
       case args do
         [] -> command
-        args when is_list(args) -> Enum.join([command | args], " ")
+        args -> Enum.join([command | args], " ")
       end
+
+    env =
+      (workload.env || %{})
+      |> Enum.map(fn {k, v} -> {to_charlist(k), to_charlist(v)} end)
 
     exec_opts = [
       :stdout,
       :stderr,
       :monitor,
-      {:kill_timeout, spec[:kill_timeout] || 5000},
-      {:env, Enum.map(env, fn {k, v} -> {to_charlist(k), to_charlist(v)} end)},
-      {:cd, to_charlist(cwd)}
+      {:kill_timeout, 5000},
+      {:env, env},
+      {:cd, ~c"/tmp"}
     ]
 
     case :exec.run_link(to_charlist(full_command), exec_opts) do
       {:ok, pid, os_pid} ->
-        {:ok, %{pid: pid, os_pid: os_pid, command: command}}
+        {:ok, %{pid: pid, os_pid: os_pid, kind: :process}}
 
       {:error, reason} ->
         {:error, reason}
     end
-  end
-
-  defp start_microvm(_workload_id, spec) do
-    VMManager.start_vm(spec)
   end
 
   defp stop_process(%{os_pid: os_pid}) do
@@ -239,43 +282,98 @@ defmodule Mxc.Agent.Executor do
     :ok
   end
 
-  defp stop_microvm(local_state) do
-    VMManager.stop_vm(local_state)
+  # Private — MicroVM workloads
+
+  defp start_microvm(%Workload{} = workload) do
+    # command field contains the nixosConfiguration name
+    config_name = workload.command
+
+    case Mxc.Platform.validate_workload_type("microvm") do
+      :ok ->
+        case MicroVM.start_vm(config_name) do
+          {:ok, vm_state} ->
+            {:ok, Map.put(vm_state, :kind, :microvm)}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
+
+  defp handle_sync_start_result(workload, result, state) do
+    case result do
+      {:ok, local_state} ->
+        Logger.info("Started workload #{workload.id} (#{workload.type}): #{workload.command}")
+
+        entry = %{
+          id: workload.id,
+          type: workload.type,
+          command: workload.command,
+          local_state: local_state,
+          started_at: DateTime.utc_now(),
+          cpu_required: workload.cpu_required,
+          memory_required: workload.memory_required
+        }
+
+        notify_coordinator(workload.id, "running", %{started_at: DateTime.utc_now()})
+        {:reply, :ok, put_in(state.workloads[workload.id], entry)}
+
+      {:error, reason} = error ->
+        Logger.error("Failed to start workload #{workload.id}: #{inspect(reason)}")
+        notify_coordinator(workload.id, "failed", %{error: inspect(reason)})
+        {:reply, error, state}
+    end
+  end
+
+  # Private — Find workload by erlang pid
 
   defp find_workload_by_pid(workloads, pid) do
     Enum.find(workloads, fn {_id, w} ->
-      w.type == :process and w.local_state[:pid] == pid
+      w.local_state[:pid] == pid
     end)
   end
 
-  defp notify_coordinator(workload_id, status, metadata \\ %{})
+  # Private — Notify coordinator of status changes
 
   defp notify_coordinator(workload_id, status, metadata) do
-    attrs = %{status: to_string(status)}
+    mode = Application.get_env(:mxc, :mode, :standalone)
+
+    attrs = %{status: status}
     attrs = if metadata[:error], do: Map.put(attrs, :error, metadata[:error]), else: attrs
+    attrs = if metadata[:started_at], do: Map.put(attrs, :started_at, metadata[:started_at]), else: attrs
+    attrs = if metadata[:stopped_at], do: Map.put(attrs, :stopped_at, metadata[:stopped_at]), else: attrs
 
-    attrs =
-      case status do
-        :running -> Map.put(attrs, :started_at, DateTime.utc_now())
-        s when s in [:stopped, :failed] -> Map.put(attrs, :stopped_at, DateTime.utc_now())
-        _ -> attrs
-      end
-
-    case find_coordinator_node() do
-      nil ->
-        Logger.warning("No coordinator node found to report status update")
-
-      coordinator ->
-        case :rpc.call(coordinator, Mxc.Coordinator, :get_workload, [workload_id]) do
+    case mode do
+      m when m in [:standalone, :coordinator] ->
+        # Same BEAM node — call Coordinator directly
+        case Mxc.Coordinator.get_workload(workload_id) do
           {:ok, workload} ->
-            :rpc.call(coordinator, Mxc.Coordinator, :update_workload, [workload, attrs])
+            Mxc.Coordinator.update_workload(workload, attrs)
 
           {:error, :not_found} ->
-            Logger.warning("Workload #{workload_id} not found on coordinator")
+            Logger.warning("Workload #{workload_id} not found in coordinator")
+        end
 
-          {:badrpc, reason} ->
-            Logger.debug("RPC to coordinator failed: #{inspect(reason)}")
+      :agent ->
+        # Distributed — RPC to coordinator node
+        case find_coordinator_node() do
+          nil ->
+            Logger.warning("No coordinator node found")
+
+          coordinator ->
+            case :rpc.call(coordinator, Mxc.Coordinator, :get_workload, [workload_id]) do
+              {:ok, workload} ->
+                :rpc.call(coordinator, Mxc.Coordinator, :update_workload, [workload, attrs])
+
+              {:error, :not_found} ->
+                Logger.warning("Workload #{workload_id} not found on coordinator")
+
+              {:badrpc, reason} ->
+                Logger.warning("RPC to coordinator failed: #{inspect(reason)}")
+            end
         end
     end
   end

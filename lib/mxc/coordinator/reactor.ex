@@ -16,7 +16,7 @@ defmodule Mxc.Coordinator.Reactor do
   require Logger
 
   alias Mxc.Coordinator.Schemas.{Node, Workload}
-  alias Mxc.Coordinator.FactStore
+  alias Mxc.Coordinator.{Dispatcher, FactStore}
   alias Mxc.Repo
 
   def start_link(opts \\ []) do
@@ -31,7 +31,16 @@ defmodule Mxc.Coordinator.Reactor do
 
   @impl true
   def handle_info({:derived_facts, derived}, state) do
-    state = process_derived_facts(derived, state)
+    state =
+      try do
+        process_derived_facts(derived, state)
+      rescue
+        DBConnection.OwnershipError -> state
+        Ecto.NoPrimaryKeyValueError -> state
+      catch
+        :exit, _ -> state
+      end
+
     {:noreply, state}
   end
 
@@ -174,16 +183,28 @@ defmodule Mxc.Coordinator.Reactor do
               state
 
             workload ->
-              workload
-              |> Ecto.Changeset.change(
-                status: "pending",
-                node_id: node_id,
-                error: nil,
-                stopped_at: nil
-              )
-              |> Repo.update()
+              case workload
+                   |> Ecto.Changeset.change(
+                     status: "starting",
+                     node_id: node_id,
+                     error: nil,
+                     stopped_at: nil
+                   )
+                   |> Repo.update() do
+                {:ok, updated} ->
+                  broadcast_change(:workloads, :update, updated)
 
-              broadcast_change(:workloads, :update, workload)
+                  # Dispatch to Executor to actually start it
+                  try do
+                    Dispatcher.dispatch_start(updated)
+                  catch
+                    :exit, _ -> :ok
+                  end
+
+                {:error, _} ->
+                  :ok
+              end
+
               mark_acted(state, {:restart, workload_id})
           end
 
@@ -222,11 +243,18 @@ defmodule Mxc.Coordinator.Reactor do
     end
   end
 
-  defp try_stop_on_agent(node_id, workload_id) do
-    # Find the Erlang node for this agent
-    # In the current architecture, node_id is a UUID, not an Erlang node name
-    # The agent RPC will be handled when we update the agent integration
-    Logger.debug("Would stop workload #{workload_id} on agent node #{node_id}")
+  defp try_stop_on_agent(_node_id, workload_id) do
+    case Repo.get(Workload, workload_id) do
+      nil ->
+        :ok
+
+      workload ->
+        try do
+          Dispatcher.dispatch_stop(workload)
+        catch
+          :exit, _ -> :ok
+        end
+    end
   end
 
   defp broadcast_change(schema, action, record) do

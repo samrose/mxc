@@ -9,7 +9,7 @@ defmodule Mxc.Agent do
   - Managing the workload lifecycle on the local node
   """
 
-  alias Mxc.Agent.{Executor, Health, VMManager}
+  alias Mxc.Agent.{Executor, Health}
 
   @doc """
   Returns the current node's resource information.
@@ -50,6 +50,6 @@ defmodule Mxc.Agent do
   Checks if this agent can run microVMs.
   """
   def can_run_microvms? do
-    hypervisor() != nil and VMManager.available?()
+    Mxc.Platform.can_run_microvms?()
   end
 end

@@ -10,7 +10,7 @@ defmodule Mxc.Coordinator do
 
   alias Mxc.Repo
   alias Mxc.Coordinator.Schemas.{Node, Workload, WorkloadEvent, SchedulingRule}
-  alias Mxc.Coordinator.FactStore
+  alias Mxc.Coordinator.{Dispatcher, FactStore}
 
   # ── Nodes ──────────────────────────────────────────────────────────
 
@@ -77,24 +77,31 @@ defmodule Mxc.Coordinator do
   end
 
   @doc """
-  Deploys a workload: creates it in Postgres, then uses FactStore
-  to find the best node via Datalog-derived placement candidates.
+  Deploys a workload: validates platform support, creates it in Postgres,
+  uses FactStore/datalox rules to find the best node via Datalog-derived
+  placement candidates, then dispatches to the Agent Executor to actually
+  run it.
   """
   def deploy_workload(attrs) do
-    workload_attrs = %{
-      type: to_string(attrs[:type] || attrs["type"] || "process"),
-      status: "pending",
-      command: attrs[:command] || attrs["command"],
-      args: attrs[:args] || attrs["args"] || [],
-      env: attrs[:env] || attrs["env"] || %{},
-      cpu_required: attrs[:cpu] || attrs["cpu"] || attrs[:cpu_required] || 1,
-      memory_required: attrs[:memory_mb] || attrs["memory_mb"] || attrs[:memory_required] || 256,
-      constraints: attrs[:constraints] || attrs["constraints"] || %{}
-    }
+    type = to_string(attrs[:type] || attrs["type"] || "process")
 
-    with {:ok, workload} <- create_workload(workload_attrs) do
-      # Try FactStore placement if available (not started in test)
-      place_workload(workload)
+    # Validate workload type against platform capabilities
+    with :ok <- Mxc.Platform.validate_workload_type(type) do
+      workload_attrs = %{
+        type: type,
+        status: "pending",
+        command: attrs[:command] || attrs["command"],
+        args: attrs[:args] || attrs["args"] || [],
+        env: attrs[:env] || attrs["env"] || %{},
+        cpu_required: attrs[:cpu] || attrs["cpu"] || attrs[:cpu_required] || 1,
+        memory_required: attrs[:memory_mb] || attrs["memory_mb"] || attrs[:memory_required] || 256,
+        constraints: build_constraints(type, attrs)
+      }
+
+      with {:ok, workload} <- create_workload(workload_attrs) do
+        # Use FactStore/datalox rules for placement, then dispatch to Executor
+        place_and_dispatch(workload)
+      end
     end
   end
 
@@ -105,10 +112,20 @@ defmodule Mxc.Coordinator do
 
       workload ->
         if workload.status in ["running", "starting"] do
-          workload
-          |> Workload.changeset(%{status: "stopping"})
-          |> Repo.update()
-          |> tap_broadcast(:workloads, :update)
+          with {:ok, updated} <-
+                 workload
+                 |> Workload.changeset(%{status: "stopping"})
+                 |> Repo.update()
+                 |> tap_broadcast(:workloads, :update) do
+            # Dispatch stop to the Executor
+            try do
+              Dispatcher.dispatch_stop(updated)
+            catch
+              :exit, _ -> :ok
+            end
+
+            {:ok, updated}
+          end
         else
           {:error, :invalid_state}
         end
@@ -214,7 +231,7 @@ defmodule Mxc.Coordinator do
 
   # ── Private ────────────────────────────────────────────────────────
 
-  defp place_workload(workload) do
+  defp place_and_dispatch(workload) do
     broadcast_fact_change(:workloads, :create, workload)
 
     try do
@@ -226,14 +243,25 @@ defmodule Mxc.Coordinator do
           {:ok, workload}
 
         _ ->
+          # Datalox rules derived placement_candidate(Workload, Node, CpuFree, MemFree)
+          # Pick the node with most available resources (spread strategy)
           {_, [_, node_id, _, _]} =
             Enum.max_by(candidates, fn {_, [_, _, cpu, mem]} -> cpu + mem end)
 
           case workload
                |> Workload.changeset(%{node_id: node_id, status: "starting"})
                |> Repo.update() do
-            {:ok, _placed} = ok ->
-              tap_broadcast(ok, :workloads, :update)
+            {:ok, placed} ->
+              broadcast_fact_change(:workloads, :update, placed)
+
+              # Actually dispatch to the Executor to run the workload
+              try do
+                Dispatcher.dispatch_start(placed)
+              catch
+                :exit, _ -> :ok
+              end
+
+              {:ok, placed}
 
             {:error, _changeset} ->
               {:ok, workload}
@@ -243,6 +271,20 @@ defmodule Mxc.Coordinator do
       :exit, _ ->
         # FactStore not running (e.g. in tests)
         {:ok, workload}
+    end
+  end
+
+  defp build_constraints(type, attrs) do
+    base = attrs[:constraints] || attrs["constraints"] || %{}
+
+    case type do
+      "microvm" ->
+        # Auto-add microvm capability constraint so datalox rules
+        # only place on nodes that can run VMs
+        Map.put(base, "microvm", "true")
+
+      _ ->
+        base
     end
   end
 
