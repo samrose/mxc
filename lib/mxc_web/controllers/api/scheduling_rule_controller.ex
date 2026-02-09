@@ -1,31 +1,31 @@
-defmodule MxcWeb.API.NodeController do
+defmodule MxcWeb.API.SchedulingRuleController do
   use MxcWeb, :controller
 
   alias Mxc.Coordinator
 
   def index(conn, _params) do
-    nodes = Coordinator.list_nodes()
-    json(conn, %{data: nodes})
+    rules = Coordinator.list_scheduling_rules()
+    json(conn, %{data: rules})
   end
 
-  def show(conn, %{"id" => node_id}) do
-    case Coordinator.get_node(node_id) do
-      {:ok, node} ->
-        json(conn, %{data: node})
+  def show(conn, %{"id" => id}) do
+    case Coordinator.get_scheduling_rule(id) do
+      {:ok, rule} ->
+        json(conn, %{data: rule})
 
       {:error, :not_found} ->
         conn
         |> put_status(:not_found)
-        |> json(%{error: "Node not found"})
+        |> json(%{error: "Scheduling rule not found"})
     end
   end
 
   def create(conn, params) do
-    case Coordinator.create_node(params) do
-      {:ok, node} ->
+    case Coordinator.create_scheduling_rule(params) do
+      {:ok, rule} ->
         conn
         |> put_status(:created)
-        |> json(%{data: node})
+        |> json(%{data: rule})
 
       {:error, %Ecto.Changeset{} = changeset} ->
         conn
@@ -34,15 +34,15 @@ defmodule MxcWeb.API.NodeController do
     end
   end
 
-  def update(conn, %{"id" => node_id} = params) do
-    with {:ok, node} <- Coordinator.get_node(node_id),
-         {:ok, updated} <- Coordinator.update_node(node, Map.delete(params, "id")) do
+  def update(conn, %{"id" => id} = params) do
+    with {:ok, rule} <- Coordinator.get_scheduling_rule(id),
+         {:ok, updated} <- Coordinator.update_scheduling_rule(rule, Map.delete(params, "id")) do
       json(conn, %{data: updated})
     else
       {:error, :not_found} ->
         conn
         |> put_status(:not_found)
-        |> json(%{error: "Node not found"})
+        |> json(%{error: "Scheduling rule not found"})
 
       {:error, %Ecto.Changeset{} = changeset} ->
         conn
@@ -51,15 +51,15 @@ defmodule MxcWeb.API.NodeController do
     end
   end
 
-  def delete(conn, %{"id" => node_id}) do
-    with {:ok, node} <- Coordinator.get_node(node_id),
-         {:ok, _deleted} <- Coordinator.delete_node(node) do
+  def delete(conn, %{"id" => id}) do
+    with {:ok, rule} <- Coordinator.get_scheduling_rule(id),
+         {:ok, _deleted} <- Coordinator.delete_scheduling_rule(rule) do
       send_resp(conn, :no_content, "")
     else
       {:error, :not_found} ->
         conn
         |> put_status(:not_found)
-        |> json(%{error: "Node not found"})
+        |> json(%{error: "Scheduling rule not found"})
     end
   end
 

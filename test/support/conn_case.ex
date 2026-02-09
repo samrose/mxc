@@ -31,6 +31,11 @@ defmodule MxcWeb.ConnCase do
     end
   end
 
+  @doc "Adds the test API token to a connection"
+  def authed(conn) do
+    Plug.Conn.put_req_header(conn, "authorization", "Bearer test-token")
+  end
+
   setup tags do
     Mxc.DataCase.setup_sandbox(tags)
     {:ok, conn: Phoenix.ConnTest.build_conn()}

@@ -1,0 +1,31 @@
+% Lifecycle Rules
+% Derives valid state transitions and workload lifecycle actions.
+
+% Valid state transitions
+valid_transition(pending, starting).
+valid_transition(starting, running).
+valid_transition(running, stopping).
+valid_transition(stopping, stopped).
+valid_transition(starting, failed).
+valid_transition(running, failed).
+
+% A workload can transition when the transition is valid
+can_transition(Workload, NextStatus) :-
+    workload(Workload, _, CurrentStatus),
+    valid_transition(CurrentStatus, NextStatus).
+
+% A workload should be marked failed if its node is unhealthy
+should_fail(Workload) :-
+    workload(Workload, _, running),
+    workload_placement(Workload, Node),
+    not node_healthy(Node).
+
+% A workload is restartable if it failed and there exists a node that can accept it
+can_restart(Workload) :-
+    workload(Workload, _, failed),
+    workload_resources(Workload, CpuReq, MemReq),
+    node_healthy(Node),
+    node_resources_free(Node, CpuFree, MemFree),
+    CpuFree >= CpuReq,
+    MemFree >= MemReq,
+    not constraint_violated(Workload, Node).

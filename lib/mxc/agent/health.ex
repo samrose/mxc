@@ -2,11 +2,8 @@ defmodule Mxc.Agent.Health do
   @moduledoc """
   Reports agent health and resource availability to the coordinator.
 
-  Periodically sends heartbeats with:
-  - CPU cores available
-  - Memory available
-  - Running workloads
-  - Hypervisor status
+  Periodically sends heartbeats with resource usage to the coordinator
+  via RPC, which writes to Postgres and syncs to the FactStore.
   """
 
   use GenServer
@@ -20,16 +17,10 @@ defmodule Mxc.Agent.Health do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc """
-  Returns current node information.
-  """
   def get_info do
     GenServer.call(__MODULE__, :get_info)
   end
 
-  @doc """
-  Triggers an immediate status report to the coordinator.
-  """
   def report_now do
     GenServer.cast(__MODULE__, :report_now)
   end
@@ -38,10 +29,10 @@ defmodule Mxc.Agent.Health do
 
   @impl true
   def init(_opts) do
-    # Schedule first heartbeat
     schedule_heartbeat()
 
     state = %{
+      node_id: Application.get_env(:mxc, :node_id),
       cpu_cores: detect_cpu_cores(),
       memory_mb: detect_memory_mb(),
       hypervisor: Application.get_env(:mxc, :hypervisor)
@@ -64,7 +55,6 @@ defmodule Mxc.Agent.Health do
 
   @impl true
   def handle_cast(:report_status, state) do
-    # Called by coordinator when node connects
     report_to_coordinator(state)
     {:noreply, state}
   end
@@ -83,27 +73,49 @@ defmodule Mxc.Agent.Health do
   end
 
   defp report_to_coordinator(state) do
-    status = build_status(state)
+    case state.node_id do
+      nil ->
+        Logger.debug("No node_id configured, skipping heartbeat")
 
-    # Find coordinator node and send status
-    coordinator_nodes =
-      Node.list()
-      |> Enum.filter(&coordinator_node?/1)
+      node_id ->
+        status = build_status(state)
 
-    case coordinator_nodes do
-      [coordinator | _] ->
-        GenServer.cast(
-          {Mxc.Coordinator.NodeManager, coordinator},
-          {:report_status, node(), status}
-        )
+        attrs = %{
+          cpu_used: status.cpu_cores - status.available_cpu,
+          memory_used: status.memory_mb - status.available_memory_mb,
+          status: "available"
+        }
 
-      [] ->
-        Logger.debug("No coordinator node found, skipping heartbeat")
+        case find_coordinator_node() do
+          nil ->
+            Logger.debug("No coordinator node found, skipping heartbeat")
+
+          coordinator ->
+            case :rpc.call(coordinator, Mxc.Coordinator, :heartbeat_node, [node_id, attrs]) do
+              {:ok, _node} ->
+                :ok
+
+              {:error, :not_found} ->
+                Logger.warning("Node #{node_id} not registered on coordinator, cannot heartbeat")
+
+              {:badrpc, reason} ->
+                Logger.debug("RPC to coordinator failed: #{inspect(reason)}")
+
+              other ->
+                Logger.debug("Heartbeat result: #{inspect(other)}")
+            end
+        end
     end
   end
 
   defp build_status(state) do
-    workloads = Mxc.Agent.Executor.list_workloads()
+    workloads =
+      try do
+        Mxc.Agent.Executor.list_workloads()
+      catch
+        :exit, _ -> []
+      end
+
     {used_cpu, used_memory} = calculate_resource_usage(workloads)
 
     %{
@@ -125,14 +137,14 @@ defmodule Mxc.Agent.Health do
     end)
   end
 
-  defp coordinator_node?(node) do
-    node
-    |> Atom.to_string()
-    |> String.starts_with?("coordinator@")
+  defp find_coordinator_node do
+    Node.list()
+    |> Enum.find(fn node ->
+      node |> Atom.to_string() |> String.starts_with?("coordinator@")
+    end)
   end
 
   defp detect_cpu_cores do
-    # Check config first, then auto-detect
     case Application.get_env(:mxc, :cpu_cores, 0) do
       0 -> System.schedulers_online()
       n -> n
@@ -140,7 +152,6 @@ defmodule Mxc.Agent.Health do
   end
 
   defp detect_memory_mb do
-    # Check config first, then auto-detect
     case Application.get_env(:mxc, :memory_mb, 0) do
       0 -> detect_system_memory_mb()
       n -> n
@@ -148,10 +159,8 @@ defmodule Mxc.Agent.Health do
   end
 
   defp detect_system_memory_mb do
-    # Try to detect system memory
     case :os.type() do
       {:unix, :darwin} ->
-        # macOS
         case System.cmd("sysctl", ["-n", "hw.memsize"], stderr_to_stdout: true) do
           {output, 0} ->
             output
@@ -164,7 +173,6 @@ defmodule Mxc.Agent.Health do
         end
 
       {:unix, _} ->
-        # Linux
         case File.read("/proc/meminfo") do
           {:ok, content} ->
             case Regex.run(~r/MemTotal:\s+(\d+)\s+kB/, content) do

@@ -21,7 +21,7 @@
         # Elixir/Erlang versions
         erlang = pkgs.beam.interpreters.erlang_27;
         beamPackages = pkgs.beam.packagesWith erlang;
-        elixir = beamPackages.elixir_1_17;
+        elixir = beamPackages.elixir_1_18;
 
         # Common build inputs for Elixir projects
         elixirDeps = [
@@ -57,6 +57,7 @@
             nodejs_20  # For Phoenix assets
 
             # Tools
+            git
             just
             jq
           ])

@@ -1,0 +1,33 @@
+% Scheduling Rules
+% Derives placement candidates for pending workloads.
+
+% A node is healthy if available and heartbeated within 30 seconds
+node_healthy(Node) :-
+    node(Node, _, available),
+    node_heartbeat(Node, LastSeen),
+    now(Now),
+    Now - LastSeen < 30.
+
+% node_resources_free(Node, CpuFree, MemFree) is asserted by FactProjection
+% (workaround for datalox safety checker bug with assignment guards)
+
+% A constraint is violated when a workload requires a capability the node lacks
+constraint_violated(Workload, Node) :-
+    workload_constraint(Workload, CapType, CapValue),
+    node_healthy(Node),
+    not node_capability(Node, CapType, CapValue).
+
+% A node can accept a workload if healthy, has capacity, and meets constraints
+can_place(Workload, Node) :-
+    workload(Workload, _, pending),
+    workload_resources(Workload, CpuReq, MemReq),
+    node_healthy(Node),
+    node_resources_free(Node, CpuFree, MemFree),
+    CpuFree >= CpuReq,
+    MemFree >= MemReq,
+    not constraint_violated(Workload, Node).
+
+% Placement candidates with available resources for strategy selection
+placement_candidate(Workload, Node, CpuFree, MemFree) :-
+    can_place(Workload, Node),
+    node_resources_free(Node, CpuFree, MemFree).

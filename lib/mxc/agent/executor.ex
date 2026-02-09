@@ -252,16 +252,31 @@ defmodule Mxc.Agent.Executor do
   defp notify_coordinator(workload_id, status, metadata \\ %{})
 
   defp notify_coordinator(workload_id, status, metadata) do
-    # Find coordinator node and send status update
+    attrs = %{status: to_string(status)}
+    attrs = if metadata[:error], do: Map.put(attrs, :error, metadata[:error]), else: attrs
+
+    attrs =
+      case status do
+        :running -> Map.put(attrs, :started_at, DateTime.utc_now())
+        s when s in [:stopped, :failed] -> Map.put(attrs, :stopped_at, DateTime.utc_now())
+        _ -> attrs
+      end
+
     case find_coordinator_node() do
       nil ->
         Logger.warning("No coordinator node found to report status update")
 
       coordinator ->
-        GenServer.cast(
-          {Mxc.Coordinator.Workload, coordinator},
-          {:update_status, workload_id, status, metadata}
-        )
+        case :rpc.call(coordinator, Mxc.Coordinator, :get_workload, [workload_id]) do
+          {:ok, workload} ->
+            :rpc.call(coordinator, Mxc.Coordinator, :update_workload, [workload, attrs])
+
+          {:error, :not_found} ->
+            Logger.warning("Workload #{workload_id} not found on coordinator")
+
+          {:badrpc, reason} ->
+            Logger.debug("RPC to coordinator failed: #{inspect(reason)}")
+        end
     end
   end
 

@@ -4,8 +4,8 @@ defmodule Mxc.Coordinator.Supervisor do
 
   Starts and supervises:
   - Cluster topology (libcluster)
-  - NodeManager (tracks connected agents)
-  - Workload manager
+  - FactStore (datalox rules engine)
+  - Reactor (acts on derived facts)
   """
 
   use Supervisor
@@ -22,11 +22,11 @@ defmodule Mxc.Coordinator.Supervisor do
       # Cluster topology for discovering agents
       {Cluster.Supervisor, [topologies, [name: Mxc.ClusterSupervisor]]},
 
-      # Node manager tracks agent nodes
-      Mxc.Coordinator.NodeManager,
+      # FactStore: datalox database + rule evaluation
+      Mxc.Coordinator.FactStore,
 
-      # Workload lifecycle manager
-      Mxc.Coordinator.Workload
+      # Reactor: subscribes to derived facts, executes side effects
+      Mxc.Coordinator.Reactor
     ]
 
     Supervisor.init(children, strategy: :one_for_one)

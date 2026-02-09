@@ -81,6 +81,11 @@ if cluster_hosts = System.get_env("MXC_CLUSTER_HOSTS") do
   config :mxc, cluster_hosts: hosts
 end
 
+# API authentication token
+if api_token = System.get_env("MXC_API_TOKEN") do
+  config :mxc, :api_token, api_token
+end
+
 # ============================================================================
 # Phoenix/Web Configuration
 # ============================================================================

@@ -12,6 +12,7 @@ defmodule MxcWeb.Router do
 
   pipeline :api do
     plug :accepts, ["json"]
+    plug MxcWeb.Plugs.APIAuth
   end
 
   scope "/", MxcWeb do
@@ -29,13 +30,12 @@ defmodule MxcWeb.Router do
   scope "/api", MxcWeb.API do
     pipe_through :api
 
-    get "/nodes", NodeController, :index
-    get "/nodes/:id", NodeController, :show
+    resources "/nodes", NodeController, only: [:index, :show, :create, :update, :delete]
 
-    get "/workloads", WorkloadController, :index
-    post "/workloads", WorkloadController, :create
-    get "/workloads/:id", WorkloadController, :show
+    resources "/workloads", WorkloadController, only: [:index, :show, :create, :delete]
     post "/workloads/:id/stop", WorkloadController, :stop
+
+    resources "/rules", SchedulingRuleController, only: [:index, :show, :create, :update, :delete]
 
     get "/cluster/status", ClusterController, :status
   end

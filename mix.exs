@@ -5,7 +5,7 @@ defmodule Mxc.MixProject do
     [
       app: :mxc,
       version: "0.1.0",
-      elixir: "~> 1.15",
+      elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
@@ -13,7 +13,31 @@ defmodule Mxc.MixProject do
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       listeners: [Phoenix.CodeReloader],
       escript: escript(),
-      releases: releases()
+      releases: releases(),
+      test_coverage: [
+        summary: [threshold: 60],
+        ignore_modules: [
+          # CLI modules (require running system)
+          Mxc.CLI,
+          Mxc.CLI.API,
+          Mxc.CLI.Commands.Cluster,
+          Mxc.CLI.Commands.Nodes,
+          Mxc.CLI.Commands.Workloads,
+          Mxc.CLI.Output,
+          # Agent modules (require erlexec/distributed system)
+          Mxc.Agent,
+          Mxc.Agent.Executor,
+          Mxc.Agent.Health,
+          Mxc.Agent.VMManager,
+          Mxc.Agent.Supervisor,
+          # Phoenix boilerplate
+          MxcWeb.CoreComponents,
+          MxcWeb.Gettext,
+          MxcWeb.Layouts,
+          MxcWeb.PageHTML,
+          MxcWeb.Mailer
+        ]
+      ]
     ]
   end
 
@@ -89,7 +113,10 @@ defmodule Mxc.MixProject do
       {:libcluster_postgres, "~> 0.1"},
 
       # Process execution for agent
-      {:erlexec, "~> 2.0"}
+      {:erlexec, "~> 2.0"},
+
+      # Datalog engine
+      {:datalox, github: "samrose/datalox"}
     ]
   end
 

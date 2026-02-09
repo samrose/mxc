@@ -9,6 +9,7 @@ defmodule MxcWeb.WorkloadsLive do
   def mount(_params, _session, socket) do
     if connected?(socket) do
       :timer.send_interval(@refresh_interval, self(), :refresh)
+      Phoenix.PubSub.subscribe(Mxc.PubSub, "fact_changes")
     end
 
     socket =
@@ -26,7 +27,6 @@ defmodule MxcWeb.WorkloadsLive do
   def handle_params(%{"id" => workload_id}, _uri, socket) do
     case Coordinator.get_workload(workload_id) do
       {:ok, workload} ->
-        Phoenix.PubSub.subscribe(Mxc.PubSub, "workloads:#{workload_id}")
         {:noreply, assign(socket, :selected_workload, workload)}
 
       {:error, :not_found} ->
@@ -60,11 +60,8 @@ defmodule MxcWeb.WorkloadsLive do
   end
 
   @impl true
-  def handle_info({:workload_status, workload}, socket) do
-    {:noreply,
-     socket
-     |> assign(:selected_workload, workload)
-     |> load_workloads()}
+  def handle_info({:fact_change, _, _, _}, socket) do
+    {:noreply, load_workloads(socket)}
   end
 
   defp load_workloads(socket) do
@@ -95,7 +92,7 @@ defmodule MxcWeb.WorkloadsLive do
                       <th>ID</th>
                       <th>Type</th>
                       <th>Status</th>
-                      <th>Node</th>
+                      <th>Command</th>
                       <th>Started</th>
                     </tr>
                   </thead>
@@ -106,14 +103,14 @@ defmodule MxcWeb.WorkloadsLive do
                         phx-click="select_workload"
                         phx-value-id={workload.id}
                       >
-                        <td class="font-mono text-sm"><%= workload.id %></td>
+                        <td class="font-mono text-sm"><%= String.slice(workload.id, 0..7) %></td>
                         <td><%= workload.type %></td>
                         <td>
                           <span class={status_badge_class(workload.status)}>
                             <%= workload.status %>
                           </span>
                         </td>
-                        <td class="font-mono text-xs"><%= workload.node || "-" %></td>
+                        <td class="font-mono text-xs max-w-[200px] truncate"><%= workload.command %></td>
                         <td class="text-sm"><%= format_time(workload.started_at) %></td>
                       </tr>
                     <% end %>
@@ -138,7 +135,7 @@ defmodule MxcWeb.WorkloadsLive do
               <div class="card-body">
                 <div class="flex justify-between items-start">
                   <h2 class="card-title text-lg">Workload Details</h2>
-                  <%= if @selected_workload.status in [:running, :starting] do %>
+                  <%= if @selected_workload.status in ["running", "starting"] do %>
                     <button
                       class="btn btn-error btn-sm"
                       phx-click="stop_workload"
@@ -170,8 +167,18 @@ defmodule MxcWeb.WorkloadsLive do
                   </div>
 
                   <div>
+                    <label class="text-sm text-base-content/60">Command</label>
+                    <p class="font-mono text-sm"><%= @selected_workload.command %></p>
+                  </div>
+
+                  <div>
                     <label class="text-sm text-base-content/60">Node</label>
-                    <p class="font-mono text-sm"><%= @selected_workload.node || "(not assigned)" %></p>
+                    <p class="font-mono text-sm"><%= @selected_workload.node_id || "(not assigned)" %></p>
+                  </div>
+
+                  <div>
+                    <label class="text-sm text-base-content/60">Resources</label>
+                    <p class="text-sm"><%= @selected_workload.cpu_required %> CPU, <%= @selected_workload.memory_required %> MB</p>
                   </div>
 
                   <%= if @selected_workload.error do %>
@@ -184,18 +191,12 @@ defmodule MxcWeb.WorkloadsLive do
 
                   <div>
                     <label class="text-sm text-base-content/60">Started At</label>
-                    <p class="text-sm"><%= @selected_workload.started_at || "-" %></p>
+                    <p class="text-sm"><%= format_time(@selected_workload.started_at) %></p>
                   </div>
 
                   <div>
                     <label class="text-sm text-base-content/60">Stopped At</label>
-                    <p class="text-sm"><%= @selected_workload.stopped_at || "-" %></p>
-                  </div>
-
-                  <div class="divider">Spec</div>
-
-                  <div>
-                    <pre class="bg-base-200 p-2 rounded text-xs overflow-x-auto"><%= Jason.encode!(@selected_workload.spec, pretty: true) %></pre>
+                    <p class="text-sm"><%= format_time(@selected_workload.stopped_at) %></p>
                   </div>
                 </div>
               </div>
@@ -287,7 +288,7 @@ defmodule MxcWeb.WorkloadsLive do
   @impl true
   def handle_event("stop_workload", %{"id" => workload_id}, socket) do
     case Coordinator.stop_workload(workload_id) do
-      :ok ->
+      {:ok, _workload} ->
         {:noreply,
          socket
          |> put_flash(:info, "Workload stopping...")
@@ -310,18 +311,18 @@ defmodule MxcWeb.WorkloadsLive do
 
   @impl true
   def handle_event("deploy_workload", params, socket) do
-    spec = %{
-      type: String.to_atom(params["type"]),
+    attrs = %{
+      type: params["type"] || "process",
       command: params["command"],
       cpu: String.to_integer(params["cpu"] || "1"),
       memory_mb: String.to_integer(params["memory_mb"] || "256")
     }
 
-    case Coordinator.deploy_workload(spec) do
+    case Coordinator.deploy_workload(attrs) do
       {:ok, workload} ->
         {:noreply,
          socket
-         |> put_flash(:info, "Workload #{workload.id} deployed!")
+         |> put_flash(:info, "Workload #{String.slice(workload.id, 0..7)} deployed!")
          |> assign(:show_deploy_modal, false)
          |> load_workloads()}
 
@@ -330,12 +331,12 @@ defmodule MxcWeb.WorkloadsLive do
     end
   end
 
-  defp status_badge_class(:running), do: "badge badge-success"
-  defp status_badge_class(:starting), do: "badge badge-warning"
-  defp status_badge_class(:stopping), do: "badge badge-warning"
-  defp status_badge_class(:stopped), do: "badge badge-ghost"
-  defp status_badge_class(:failed), do: "badge badge-error"
-  defp status_badge_class(:pending), do: "badge badge-info"
+  defp status_badge_class("running"), do: "badge badge-success"
+  defp status_badge_class("starting"), do: "badge badge-warning"
+  defp status_badge_class("stopping"), do: "badge badge-warning"
+  defp status_badge_class("stopped"), do: "badge badge-ghost"
+  defp status_badge_class("failed"), do: "badge badge-error"
+  defp status_badge_class("pending"), do: "badge badge-info"
   defp status_badge_class(_), do: "badge"
 
   defp format_time(nil), do: "-"

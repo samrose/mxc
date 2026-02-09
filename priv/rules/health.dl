@@ -1,0 +1,31 @@
+% Health Rules
+% Derives node health status, overload conditions, and cluster-level alerts.
+
+% Node is stale if heartbeat older than 30s but still marked available
+node_stale(Node) :-
+    node(Node, _, available),
+    node_heartbeat(Node, LastSeen),
+    now(Now),
+    Now - LastSeen >= 30.
+
+% Node is overloaded if CPU usage exceeds 90%
+node_cpu_overloaded(Node) :-
+    node_resources(Node, CpuTotal, _),
+    node_resources_used(Node, CpuUsed, _),
+    CpuUsed * 100 / CpuTotal > 90.
+
+% Node is overloaded if memory usage exceeds 90%
+node_mem_overloaded(Node) :-
+    node_resources(Node, _, MemTotal),
+    node_resources_used(Node, _, MemUsed),
+    MemUsed * 100 / MemTotal > 90.
+
+% Node is overloaded (either CPU or memory)
+node_overloaded(Node) :- node_cpu_overloaded(Node).
+node_overloaded(Node) :- node_mem_overloaded(Node).
+
+% Workload is orphaned if placed on a node that no longer exists in the node table
+workload_orphaned(Workload) :-
+    workload(Workload, _, running),
+    workload_placement(Workload, Node),
+    not node(Node, _, _).

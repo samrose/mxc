@@ -9,7 +9,7 @@ defmodule MxcWeb.DashboardLive do
   def mount(_params, _session, socket) do
     if connected?(socket) do
       :timer.send_interval(@refresh_interval, self(), :refresh)
-      Phoenix.PubSub.subscribe(Mxc.PubSub, "cluster:events")
+      Phoenix.PubSub.subscribe(Mxc.PubSub, "fact_changes")
     end
 
     socket =
@@ -26,12 +26,7 @@ defmodule MxcWeb.DashboardLive do
   end
 
   @impl true
-  def handle_info({:node_down, _node}, socket) do
-    {:noreply, load_data(socket)}
-  end
-
-  @impl true
-  def handle_info({:node_up, _node}, socket) do
+  def handle_info({:fact_change, _, _, _}, socket) do
     {:noreply, load_data(socket)}
   end
 
@@ -100,8 +95,8 @@ defmodule MxcWeb.DashboardLive do
             </svg>
           </div>
           <div class="stat-title">Memory</div>
-          <div class="stat-value text-info"><%= format_memory(@status.available_memory_mb) %></div>
-          <div class="stat-desc">of <%= format_memory(@status.total_memory_mb) %> available</div>
+          <div class="stat-value text-info"><%= format_memory(@status.available_memory) %></div>
+          <div class="stat-desc">of <%= format_memory(@status.total_memory) %> available</div>
         </div>
       </div>
 
@@ -117,7 +112,7 @@ defmodule MxcWeb.DashboardLive do
               <table class="table table-zebra">
                 <thead>
                   <tr>
-                    <th>Node</th>
+                    <th>Hostname</th>
                     <th>Status</th>
                     <th>Resources</th>
                   </tr>
@@ -125,17 +120,15 @@ defmodule MxcWeb.DashboardLive do
                 <tbody>
                   <%= for node <- @nodes do %>
                     <tr>
-                      <td class="font-mono text-sm"><%= node.node %></td>
+                      <td class="font-mono text-sm"><%= node.hostname %></td>
                       <td>
-                        <%= if node.healthy do %>
-                          <span class="badge badge-success">healthy</span>
-                        <% else %>
-                          <span class="badge badge-error">unhealthy</span>
-                        <% end %>
+                        <span class={node_status_badge(node.status)}>
+                          <%= node.status %>
+                        </span>
                       </td>
                       <td class="text-sm">
-                        <%= node.available_cpu %>/<%= node.cpu_cores %> CPU,
-                        <%= format_memory(node.available_memory_mb) %>/<%= format_memory(node.memory_mb) %>
+                        <%= node.cpu_total - node.cpu_used %>/<%= node.cpu_total %> CPU,
+                        <%= format_memory(node.memory_total - node.memory_used) %>/<%= format_memory(node.memory_total) %>
                       </td>
                     </tr>
                   <% end %>
@@ -169,7 +162,7 @@ defmodule MxcWeb.DashboardLive do
                 <tbody>
                   <%= for workload <- @recent_workloads do %>
                     <tr>
-                      <td class="font-mono text-sm"><%= workload.id %></td>
+                      <td class="font-mono text-sm"><%= String.slice(workload.id, 0..7) %></td>
                       <td><%= workload.type %></td>
                       <td>
                         <span class={status_badge_class(workload.status)}>
@@ -193,16 +186,23 @@ defmodule MxcWeb.DashboardLive do
     """
   end
 
-  defp format_memory(mb) when mb >= 1024 do
+  defp format_memory(mb) when is_number(mb) and mb >= 1024 do
     "#{Float.round(mb / 1024, 1)} GB"
   end
 
-  defp format_memory(mb), do: "#{mb} MB"
+  defp format_memory(mb) when is_number(mb), do: "#{mb} MB"
+  defp format_memory(_), do: "0 MB"
 
-  defp status_badge_class(:running), do: "badge badge-success"
-  defp status_badge_class(:starting), do: "badge badge-warning"
-  defp status_badge_class(:stopping), do: "badge badge-warning"
-  defp status_badge_class(:stopped), do: "badge badge-ghost"
-  defp status_badge_class(:failed), do: "badge badge-error"
+  defp node_status_badge("available"), do: "badge badge-success"
+  defp node_status_badge("unavailable"), do: "badge badge-error"
+  defp node_status_badge("draining"), do: "badge badge-warning"
+  defp node_status_badge(_), do: "badge"
+
+  defp status_badge_class("running"), do: "badge badge-success"
+  defp status_badge_class("starting"), do: "badge badge-warning"
+  defp status_badge_class("stopping"), do: "badge badge-warning"
+  defp status_badge_class("stopped"), do: "badge badge-ghost"
+  defp status_badge_class("failed"), do: "badge badge-error"
+  defp status_badge_class("pending"), do: "badge badge-info"
   defp status_badge_class(_), do: "badge"
 end
