@@ -28,5 +28,25 @@ defmodule Mxc.Coordinator.Schemas.WorkloadTest do
       changeset = Workload.changeset(%Workload{}, attrs)
       refute changeset.valid?
     end
+
+    test "accepts ip field" do
+      attrs = %{
+        type: "process",
+        status: "running",
+        command: "echo hello",
+        ip: "192.168.1.10"
+      }
+
+      changeset = Workload.changeset(%Workload{}, attrs)
+      assert changeset.valid?
+      assert Ecto.Changeset.get_change(changeset, :ip) == "192.168.1.10"
+    end
+
+    test "ip field is optional" do
+      attrs = %{type: "process", status: "pending", command: "echo hello"}
+      changeset = Workload.changeset(%Workload{}, attrs)
+      assert changeset.valid?
+      assert Ecto.Changeset.get_change(changeset, :ip) == nil
+    end
   end
 end

@@ -51,6 +51,16 @@ defmodule Mxc.Agent.Executor do
     GenServer.call(__MODULE__, {:get_workload, workload_id})
   end
 
+  @doc """
+  Executes a command inside a running workload's environment.
+  For microVMs, uses SSH. For processes, runs in the same shell environment.
+  Returns `{:ok, output}` or `{:error, reason}`.
+  """
+  def exec_in_workload(workload_id, command, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 30_000)
+    GenServer.call(__MODULE__, {:exec_in_workload, workload_id, command, opts}, timeout + 5_000)
+  end
+
   # Server Callbacks
 
   @impl true
@@ -174,6 +184,32 @@ defmodule Mxc.Agent.Executor do
       nil -> {:reply, {:error, :not_found}, state}
       entry -> {:reply, {:ok, entry}, state}
     end
+  end
+
+  @impl true
+  def handle_call({:exec_in_workload, workload_id, command, opts}, _from, state) do
+    timeout = Keyword.get(opts, :timeout, 30_000)
+
+    result = case Map.get(state.workloads, workload_id) do
+      nil ->
+        {:error, :not_found}
+
+      entry ->
+        shell_cmd = case entry.type do
+          "microvm" ->
+            hostname = derive_hostname(entry.command)
+            ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+            escaped = "'" <> String.replace(command, "'", "'\\''") <> "'"
+            "ssh #{ssh_opts} root@#{hostname} #{escaped}"
+
+          "process" ->
+            command
+        end
+
+        run_shell_command(shell_cmd, timeout)
+    end
+
+    {:reply, result, state}
   end
 
   @impl true
@@ -383,5 +419,23 @@ defmodule Mxc.Agent.Executor do
     |> Enum.find(fn node ->
       node |> Atom.to_string() |> String.starts_with?("coordinator@")
     end)
+  end
+
+  defp derive_hostname(config_name) do
+    # Strip architecture suffix: "pg2une-postgres-aarch64" → "pg2une-postgres"
+    config_name
+    |> String.replace(~r/-(aarch64|x86_64)$/, "")
+  end
+
+  defp run_shell_command(command, timeout) do
+    task = Task.async(fn ->
+      System.cmd("bash", ["-c", command], stderr_to_stdout: true)
+    end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task) do
+      {:ok, {output, 0}} -> {:ok, String.trim(output)}
+      {:ok, {output, code}} -> {:error, {:exit_code, code, String.trim(output)}}
+      nil -> {:error, :timeout}
+    end
   end
 end

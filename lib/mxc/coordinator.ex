@@ -132,6 +132,56 @@ defmodule Mxc.Coordinator do
     end
   end
 
+  @doc """
+  Execute a command inside a running workload.
+
+  For microVM workloads, uses SSH to connect to the guest VM using its hostname.
+  For process workloads, runs the command in the same environment.
+
+  Returns `{:ok, output}` or `{:error, reason}`.
+
+  ## Options
+
+    * `:timeout` - command timeout in milliseconds (default: 30_000)
+  """
+  def exec_in_workload(workload_id, command, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 30_000)
+
+    with {:ok, workload} <- get_workload(workload_id),
+         true <- workload.status == "running" || {:error, :workload_not_running} do
+      shell_command = case workload.type do
+        "microvm" ->
+          hostname = derive_hostname(workload.command)
+          ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+          "ssh #{ssh_opts} root@#{hostname} #{escape_shell_arg(command)}"
+
+        "process" ->
+          command
+      end
+
+      run_shell_command(shell_command, timeout)
+    end
+  end
+
+  @doc """
+  Discover and store the IP address of a running workload.
+
+  Queries the workload's network interface and stores the IP in the workload record.
+  Returns `{:ok, updated_workload}` or `{:error, reason}`.
+  """
+  def discover_workload_ip(workload_id) do
+    with {:ok, output} <- exec_in_workload(workload_id, "hostname -I | awk '{print $1}'"),
+         {:ok, workload} <- get_workload(workload_id) do
+      ip = String.trim(output)
+
+      if ip != "" do
+        update_workload(workload, %{ip: ip})
+      else
+        {:error, :no_ip_found}
+      end
+    end
+  end
+
   def create_workload(attrs) do
     %Workload{}
     |> Workload.changeset(attrs)
@@ -302,4 +352,26 @@ defmodule Mxc.Coordinator do
   end
 
   defp tap_broadcast(error, _schema, _action), do: error
+
+  defp derive_hostname(config_name) do
+    # Strip architecture suffix: "pg2une-postgres-aarch64" → "pg2une-postgres"
+    config_name
+    |> String.replace(~r/-(aarch64|x86_64)$/, "")
+  end
+
+  defp escape_shell_arg(arg) do
+    "'" <> String.replace(arg, "'", "'\\''") <> "'"
+  end
+
+  defp run_shell_command(command, timeout) do
+    task = Task.async(fn ->
+      System.cmd("bash", ["-c", command], stderr_to_stdout: true)
+    end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task) do
+      {:ok, {output, 0}} -> {:ok, String.trim(output)}
+      {:ok, {output, code}} -> {:error, {:exit_code, code, String.trim(output)}}
+      nil -> {:error, :timeout}
+    end
+  end
 end

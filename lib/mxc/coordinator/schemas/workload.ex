@@ -14,6 +14,7 @@ defmodule Mxc.Coordinator.Schemas.Workload do
              :memory_required,
              :constraints,
              :error,
+             :ip,
              :node_id,
              :started_at,
              :stopped_at,
@@ -34,6 +35,7 @@ defmodule Mxc.Coordinator.Schemas.Workload do
     field :memory_required, :integer, default: 256
     field :constraints, :map, default: %{}
     field :error, :string
+    field :ip, :string
     field :started_at, :utc_datetime
     field :stopped_at, :utc_datetime
 
@@ -45,7 +47,7 @@ defmodule Mxc.Coordinator.Schemas.Workload do
   end
 
   @required_fields ~w(type status command)a
-  @optional_fields ~w(args env cpu_required memory_required constraints error started_at stopped_at node_id)a
+  @optional_fields ~w(args env cpu_required memory_required constraints error ip started_at stopped_at node_id)a
   @valid_types ~w(process microvm)
   @valid_statuses ~w(pending starting running stopping stopped failed)
 

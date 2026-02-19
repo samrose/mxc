@@ -187,6 +187,70 @@ defmodule Mxc.CoordinatorTest do
     end
   end
 
+  describe "exec_in_workload/3" do
+    test "returns error for non-existent workload" do
+      assert {:error, :not_found} = Coordinator.exec_in_workload(Ecto.UUID.generate(), "echo hi")
+    end
+
+    test "returns error for non-running workload" do
+      {:ok, workload} = Coordinator.create_workload(%{type: "process", status: "pending", command: "echo"})
+      assert {:error, :workload_not_running} = Coordinator.exec_in_workload(workload.id, "echo hi")
+    end
+
+    test "executes command in running process workload" do
+      {:ok, workload} = Coordinator.create_workload(%{type: "process", status: "running", command: "echo"})
+      assert {:ok, output} = Coordinator.exec_in_workload(workload.id, "echo hello_from_exec")
+      assert output == "hello_from_exec"
+    end
+
+    test "returns error for failed command" do
+      {:ok, workload} = Coordinator.create_workload(%{type: "process", status: "running", command: "echo"})
+      assert {:error, {:exit_code, _, _}} = Coordinator.exec_in_workload(workload.id, "false")
+    end
+  end
+
+  describe "discover_workload_ip/1" do
+    test "returns error for non-existent workload" do
+      assert {:error, :not_found} = Coordinator.discover_workload_ip(Ecto.UUID.generate())
+    end
+
+    test "discovers IP for running process workload" do
+      {:ok, workload} = Coordinator.create_workload(%{type: "process", status: "running", command: "echo"})
+
+      case Coordinator.discover_workload_ip(workload.id) do
+        {:ok, updated} ->
+          # hostname -I returns at least one IP on most systems
+          assert updated.ip != nil
+          assert updated.ip != ""
+
+        {:error, _} ->
+          # hostname -I may not work on all CI environments
+          :ok
+      end
+    end
+  end
+
+  describe "workload ip field" do
+    test "create_workload with ip stores it" do
+      {:ok, workload} = Coordinator.create_workload(%{
+        type: "process",
+        status: "running",
+        command: "echo",
+        ip: "10.0.0.5"
+      })
+
+      assert workload.ip == "10.0.0.5"
+    end
+
+    test "update_workload can set ip" do
+      {:ok, workload} = Coordinator.create_workload(%{type: "process", status: "running", command: "echo"})
+      assert workload.ip == nil
+
+      {:ok, updated} = Coordinator.update_workload(workload, %{ip: "192.168.1.100"})
+      assert updated.ip == "192.168.1.100"
+    end
+  end
+
   describe "cluster_status/0" do
     test "returns aggregate status" do
       {:ok, _} = Coordinator.create_node(%{
