@@ -148,18 +148,10 @@ defmodule Mxc.Coordinator do
     timeout = Keyword.get(opts, :timeout, 30_000)
 
     with {:ok, workload} <- get_workload(workload_id),
-         true <- workload.status == "running" || {:error, :workload_not_running} do
-      shell_command = case workload.type do
-        "microvm" ->
-          hostname = derive_hostname(workload.command)
-          ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
-          "ssh #{ssh_opts} root@#{hostname} #{escape_shell_arg(command)}"
-
-        "process" ->
-          command
-      end
-
-      run_shell_command(shell_command, timeout)
+         :ok <- ensure_running(workload) do
+      workload
+      |> build_exec_command(command)
+      |> run_command(timeout)
     end
   end
 
@@ -172,12 +164,9 @@ defmodule Mxc.Coordinator do
   def discover_workload_ip(workload_id) do
     with {:ok, output} <- exec_in_workload(workload_id, "hostname -I | awk '{print $1}'"),
          {:ok, workload} <- get_workload(workload_id) do
-      ip = String.trim(output)
-
-      if ip != "" do
-        update_workload(workload, %{ip: ip})
-      else
-        {:error, :no_ip_found}
+      case String.trim(output) do
+        "" -> {:error, :no_ip_found}
+        ip -> update_workload(workload, %{ip: ip})
       end
     end
   end
@@ -353,25 +342,71 @@ defmodule Mxc.Coordinator do
 
   defp tap_broadcast(error, _schema, _action), do: error
 
-  defp derive_hostname(config_name) do
-    # Strip architecture suffix: "pg2une-postgres-aarch64" → "pg2une-postgres"
-    config_name
-    |> String.replace(~r/-(aarch64|x86_64)$/, "")
+  defp ensure_running(%{status: "running"}), do: :ok
+  defp ensure_running(_), do: {:error, :workload_not_running}
+
+  # microvm: argv list — passed straight to execve, no host-side shell parsing.
+  # The remote sshd still hands `command` to a shell on the guest, but that's
+  # outside our trust boundary.
+  defp build_exec_command(%{type: "microvm"} = workload, command) do
+    hostname = derive_hostname(workload.command)
+
+    [
+      ~c"ssh",
+      ~c"-o", ~c"StrictHostKeyChecking=no",
+      ~c"-o", ~c"UserKnownHostsFile=/dev/null",
+      ~c"-o", ~c"ConnectTimeout=10",
+      to_charlist("root@#{hostname}"),
+      to_charlist(command)
+    ]
   end
 
-  defp escape_shell_arg(arg) do
-    "'" <> String.replace(arg, "'", "'\\''") <> "'"
-  end
+  # process: charlist form — erlexec runs via /bin/sh -c, matching the
+  # convention in Mxc.Agent.Executor.start_process/1.
+  defp build_exec_command(%{type: "process"}, command), do: to_charlist(command)
 
-  defp run_shell_command(command, timeout) do
-    task = Task.async(fn ->
-      System.cmd("bash", ["-c", command], stderr_to_stdout: true)
-    end)
+  defp run_command(cmd, timeout) do
+    case :exec.run(cmd, [:stdout, :stderr, :monitor, {:kill_timeout, 5}]) do
+      {:ok, pid, os_pid} ->
+        deadline = System.monotonic_time(:millisecond) + timeout
+        collect_output(pid, os_pid, deadline, [])
 
-    case Task.yield(task, timeout) || Task.shutdown(task) do
-      {:ok, {output, 0}} -> {:ok, String.trim(output)}
-      {:ok, {output, code}} -> {:error, {:exit_code, code, String.trim(output)}}
-      nil -> {:error, :timeout}
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp collect_output(pid, os_pid, deadline, acc) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:stdout, ^os_pid, data} ->
+        collect_output(pid, os_pid, deadline, [acc, data])
+
+      {:stderr, ^os_pid, data} ->
+        collect_output(pid, os_pid, deadline, [acc, data])
+
+      {:DOWN, _ref, :process, ^pid, :normal} ->
+        {:ok, acc |> IO.iodata_to_binary() |> String.trim()}
+
+      {:DOWN, _ref, :process, ^pid, {:exit_status, status}} ->
+        output = acc |> IO.iodata_to_binary() |> String.trim()
+        {:error, {:exit_code, decode_exit_status(status), output}}
+    after
+      remaining ->
+        :exec.stop(os_pid)
+        {:error, :timeout}
+    end
+  end
+
+  defp decode_exit_status(status) do
+    case :exec.status(status) do
+      {:status, code} -> code
+      {:signal, _signal, _core} -> -1
+    end
+  end
+
+  defp derive_hostname(config_name) do
+    String.replace(config_name, ~r/-(aarch64|x86_64)$/, "")
   end
 end
