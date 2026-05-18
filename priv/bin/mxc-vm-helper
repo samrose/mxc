@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# mxc-vm-helper — privileged helper for Mxc.Agent.SystemdRunner.
+#
+# Invoked exclusively via sudo by the mxc agent (running as the `microvm`
+# user). The single sudo-permitted binary, so this script must stay small,
+# auditable, and free of dynamic evaluation.
+#
+# Install:
+#   1. Copy to /usr/local/bin/mxc-vm-helper (or set :mxc, :systemd_helper)
+#   2. chmod 0755
+#   3. Add to /etc/sudoers.d/mxc-vm-helper:
+#        microvm ALL=(root) NOPASSWD: /usr/local/bin/mxc-vm-helper
+#
+# Subcommands:
+#   init <id>                          — create /var/lib/microvms/<id>
+#   set-flake <id> <flake-ref>         — write <state>/flake
+#   build <id> <config-name> <hv>      — nix build runner, symlink as <state>/current
+#   start <id>                         — systemctl start microvm@<id>.service
+#   stop <id>                          — systemctl stop microvm@<id>.service
+#   restart <id>                       — systemctl restart microvm@<id>.service
+#   status <id>                        — systemctl is-active microvm@<id>.service
+#   list                               — systemctl list-units --plain microvm@*
+
+set -euo pipefail
+
+STATE_DIR="${MXC_STATE_DIR:-/var/lib/microvms}"
+NIX="${MXC_NIX_BIN:-/run/current-system/sw/bin/nix}"
+SYSTEMCTL="${MXC_SYSTEMCTL_BIN:-/run/current-system/sw/bin/systemctl}"
+MICROVM_USER="${MXC_MICROVM_USER:-microvm}"
+MICROVM_GROUP="${MXC_MICROVM_GROUP:-kvm}"
+
+die() { echo "mxc-vm-helper: $*" >&2; exit 64; }
+
+validate_id() {
+  local id="$1"
+  [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid workload id: $id"
+}
+
+validate_config() {
+  local cfg="$1"
+  [[ "$cfg" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid config name: $cfg"
+}
+
+validate_hv() {
+  local hv="$1"
+  case "$hv" in
+    qemu|cloud-hypervisor|firecracker|crosvm|kvmtool|stratovirt|alioth|vfkit) ;;
+    *) die "invalid hypervisor: $hv" ;;
+  esac
+}
+
+unit_name() { echo "microvm@$1.service"; }
+
+cmd_init() {
+  validate_id "$1"
+  local dir="$STATE_DIR/$1"
+  install -d -o "$MICROVM_USER" -g "$MICROVM_GROUP" -m 0755 "$dir"
+}
+
+cmd_set_flake() {
+  validate_id "$1"
+  local dir="$STATE_DIR/$1"
+  [[ -d "$dir" ]] || die "state dir not initialized: $dir"
+  printf '%s\n' "$2" > "$dir/flake"
+  chown "$MICROVM_USER:$MICROVM_GROUP" "$dir/flake"
+  chmod 0644 "$dir/flake"
+}
+
+cmd_build() {
+  validate_id "$1"
+  validate_config "$2"
+  validate_hv "$3"
+
+  local id="$1"
+  local config="$2"
+  local hv="$3"
+  local dir="$STATE_DIR/$id"
+
+  [[ -f "$dir/flake" ]] || die "flake reference not set for $id"
+  local flake
+  flake="$(cat "$dir/flake")"
+
+  "$NIX" build \
+    --extra-experimental-features 'nix-command flakes' \
+    "${flake}#nixosConfigurations.${config}.config.microvm.runner.${hv}" \
+    -o "$dir/current"
+
+  chown -h "$MICROVM_USER:$MICROVM_GROUP" "$dir/current"
+}
+
+cmd_start()   { validate_id "$1"; "$SYSTEMCTL" start    "$(unit_name "$1")"; }
+cmd_stop()    { validate_id "$1"; "$SYSTEMCTL" stop     "$(unit_name "$1")"; }
+cmd_restart() { validate_id "$1"; "$SYSTEMCTL" restart  "$(unit_name "$1")"; }
+cmd_status()  { validate_id "$1"; "$SYSTEMCTL" is-active "$(unit_name "$1")" || true; }
+cmd_list()    { "$SYSTEMCTL" list-units --type=service --all --no-legend --plain 'microvm@*' || true; }
+
+cmd="${1:-}"; shift || die "no subcommand"
+
+case "$cmd" in
+  init)      cmd_init      "$@" ;;
+  set-flake) cmd_set_flake "$@" ;;
+  build)     cmd_build     "$@" ;;
+  start)     cmd_start     "$@" ;;
+  stop)      cmd_stop      "$@" ;;
+  restart)   cmd_restart   "$@" ;;
+  status)    cmd_status    "$@" ;;
+  list)      cmd_list      "$@" ;;
+  *)         die "unknown subcommand: $cmd" ;;
+esac

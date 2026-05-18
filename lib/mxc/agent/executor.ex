@@ -141,9 +141,10 @@ defmodule Mxc.Agent.Executor do
 
       entry ->
         stop_result =
-          case entry.type do
-            "process" -> stop_process(entry.local_state)
-            "microvm" -> MicroVM.stop_vm(entry.local_state)
+          case {entry.type, entry.local_state[:kind]} do
+            {"process", _} -> stop_process(entry.local_state)
+            {"microvm", :microvm_systemd} -> Mxc.Agent.SystemdRunner.stop_workload(%{unit: entry.local_state[:unit], id: workload_id})
+            {"microvm", _} -> MicroVM.stop_vm(entry.local_state)
           end
 
         case stop_result do
@@ -190,27 +191,34 @@ defmodule Mxc.Agent.Executor do
   def handle_call({:exec_in_workload, workload_id, command, opts}, _from, state) do
     timeout = Keyword.get(opts, :timeout, 30_000)
 
-    result = case Map.get(state.workloads, workload_id) do
-      nil ->
-        {:error, :not_found}
+    result =
+      case Map.get(state.workloads, workload_id) do
+        nil ->
+          {:error, :not_found}
 
-      entry ->
-        shell_cmd = case entry.type do
-          "microvm" ->
-            hostname = derive_hostname(entry.command)
-            ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
-            escaped = "'" <> String.replace(command, "'", "'\\''") <> "'"
-            "ssh #{ssh_opts} root@#{hostname} #{escaped}"
-
-          "process" ->
-            command
-        end
-
-        run_shell_command(shell_cmd, timeout)
-    end
+        entry ->
+          entry
+          |> build_exec_cmd(command)
+          |> Mxc.Subprocess.run(timeout: timeout)
+      end
 
     {:reply, result, state}
   end
+
+  defp build_exec_cmd(%{type: "microvm", command: config_name}, command) do
+    hostname = derive_hostname(config_name)
+
+    [
+      ~c"ssh",
+      ~c"-o", ~c"StrictHostKeyChecking=no",
+      ~c"-o", ~c"UserKnownHostsFile=/dev/null",
+      ~c"-o", ~c"ConnectTimeout=10",
+      to_charlist("root@#{hostname}"),
+      to_charlist(command)
+    ]
+  end
+
+  defp build_exec_cmd(%{type: "process"}, command), do: to_charlist(command)
 
   @impl true
   def handle_info({:microvm_started, workload, local_state}, state) do
@@ -320,22 +328,32 @@ defmodule Mxc.Agent.Executor do
 
   # Private — MicroVM workloads
 
+  # Dispatches to either the BEAM-supervised runner (Mxc.Agent.MicroVM, erlexec)
+  # or the systemd-defer runner (Mxc.Agent.SystemdRunner). Selected by config:
+  #
+  #     config :mxc, :microvm_runner, :erlexec    # default; works on macOS dev
+  #     config :mxc, :microvm_runner, :systemd    # production Linux + microvm.host
   defp start_microvm(%Workload{} = workload) do
-    # command field contains the nixosConfiguration name
-    config_name = workload.command
+    with :ok <- Mxc.Platform.validate_workload_type("microvm") do
+      case Application.get_env(:mxc, :microvm_runner, :erlexec) do
+        :systemd -> start_microvm_systemd(workload)
+        :erlexec -> start_microvm_erlexec(workload)
+        other -> {:error, {:unknown_microvm_runner, other}}
+      end
+    end
+  end
 
-    case Mxc.Platform.validate_workload_type("microvm") do
-      :ok ->
-        case MicroVM.start_vm(config_name) do
-          {:ok, vm_state} ->
-            {:ok, Map.put(vm_state, :kind, :microvm)}
+  defp start_microvm_erlexec(%Workload{} = workload) do
+    case MicroVM.start_vm(workload.command) do
+      {:ok, vm_state} -> {:ok, Map.put(vm_state, :kind, :microvm)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      {:error, reason} ->
-        {:error, reason}
+  defp start_microvm_systemd(%Workload{} = workload) do
+    case Mxc.Agent.SystemdRunner.start_workload(workload) do
+      {:ok, sd_state} -> {:ok, Map.put(sd_state, :kind, :microvm_systemd)}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -422,20 +440,6 @@ defmodule Mxc.Agent.Executor do
   end
 
   defp derive_hostname(config_name) do
-    # Strip architecture suffix: "pg2une-postgres-aarch64" → "pg2une-postgres"
-    config_name
-    |> String.replace(~r/-(aarch64|x86_64)$/, "")
-  end
-
-  defp run_shell_command(command, timeout) do
-    task = Task.async(fn ->
-      System.cmd("bash", ["-c", command], stderr_to_stdout: true)
-    end)
-
-    case Task.yield(task, timeout) || Task.shutdown(task) do
-      {:ok, {output, 0}} -> {:ok, String.trim(output)}
-      {:ok, {output, code}} -> {:error, {:exit_code, code, String.trim(output)}}
-      nil -> {:error, :timeout}
-    end
+    String.replace(config_name, ~r/-(aarch64|x86_64)$/, "")
   end
 end

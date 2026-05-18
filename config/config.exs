@@ -17,7 +17,11 @@ config :mxc,
   # Cluster strategy: :postgres, :gossip, :dns, :epmd
   cluster_strategy: :gossip,
   # Scheduler strategy: :spread (distribute load) or :pack (bin-pack)
-  scheduler_strategy: :spread
+  scheduler_strategy: :spread,
+  # MicroVM runner: :erlexec (BEAM-supervised) or :systemd (microvm.host)
+  microvm_runner: :erlexec,
+  # Backend for the systemd runner (overridden in test.exs to use the mock)
+  systemd_backend: Mxc.Agent.SystemdRunner.Backend.Erlexec
 
 # Configure the endpoint
 config :mxc, MxcWeb.Endpoint,

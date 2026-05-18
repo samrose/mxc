@@ -361,50 +361,11 @@ defmodule Mxc.Coordinator do
     ]
   end
 
-  # process: charlist form — erlexec runs via /bin/sh -c, matching the
-  # convention in Mxc.Agent.Executor.start_process/1.
+  # process: charlist form — runs via /bin/sh -c, matching the convention in
+  # Mxc.Agent.Executor.start_process/1.
   defp build_exec_command(%{type: "process"}, command), do: to_charlist(command)
 
-  defp run_command(cmd, timeout) do
-    case :exec.run(cmd, [:stdout, :stderr, :monitor, {:kill_timeout, 5}]) do
-      {:ok, pid, os_pid} ->
-        deadline = System.monotonic_time(:millisecond) + timeout
-        collect_output(pid, os_pid, deadline, [])
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp collect_output(pid, os_pid, deadline, acc) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    receive do
-      {:stdout, ^os_pid, data} ->
-        collect_output(pid, os_pid, deadline, [acc, data])
-
-      {:stderr, ^os_pid, data} ->
-        collect_output(pid, os_pid, deadline, [acc, data])
-
-      {:DOWN, _ref, :process, ^pid, :normal} ->
-        {:ok, acc |> IO.iodata_to_binary() |> String.trim()}
-
-      {:DOWN, _ref, :process, ^pid, {:exit_status, status}} ->
-        output = acc |> IO.iodata_to_binary() |> String.trim()
-        {:error, {:exit_code, decode_exit_status(status), output}}
-    after
-      remaining ->
-        :exec.stop(os_pid)
-        {:error, :timeout}
-    end
-  end
-
-  defp decode_exit_status(status) do
-    case :exec.status(status) do
-      {:status, code} -> code
-      {:signal, _signal, _core} -> -1
-    end
-  end
+  defp run_command(cmd, timeout), do: Mxc.Subprocess.run(cmd, timeout: timeout)
 
   defp derive_hostname(config_name) do
     String.replace(config_name, ~r/-(aarch64|x86_64)$/, "")

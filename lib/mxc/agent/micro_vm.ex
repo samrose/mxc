@@ -121,8 +121,6 @@ defmodule Mxc.Agent.MicroVM do
   # Private
 
   defp do_build_runner(flake_dir, config_name, runner_dir) do
-    # microvm.runner is a set keyed by hypervisor (qemu, vfkit, cloud-hypervisor, etc.)
-    # Select the preferred hypervisor for this platform
     hypervisor = hypervisor_attr_name()
     nix_attr = ".#nixosConfigurations.#{config_name}.config.microvm.runner.#{hypervisor}"
     out_link = Path.join(runner_dir, "result")
@@ -130,28 +128,39 @@ defmodule Mxc.Agent.MicroVM do
 
     Logger.info("Building microVM runner: #{nix_bin} build #{nix_attr}")
 
-    case System.cmd(nix_bin, ["build", nix_attr, "-o", out_link],
-           cd: flake_dir,
-           stderr_to_stdout: true,
-           env: [{"NIX_CONFIG", "experimental-features = nix-command flakes"}]
-         ) do
-      {_output, 0} ->
-        # The runner script is at result/bin/microvm-run
+    # nix builds can take minutes on cold cache — generous timeout, but still
+    # bounded so a hung build doesn't wedge the executor forever.
+    argv = [to_charlist(nix_bin), ~c"build", to_charlist(nix_attr), ~c"-o", to_charlist(out_link)]
+
+    opts = [
+      timeout: 15 * 60_000,
+      kill_timeout: 10,
+      exec_opts: [
+        {:cd, to_charlist(flake_dir)},
+        {:env, [{~c"NIX_CONFIG", ~c"experimental-features = nix-command flakes"}]}
+      ]
+    ]
+
+    case Mxc.Subprocess.run(argv, opts) do
+      {:ok, _output} ->
         runner_path = Path.join([out_link, "bin", "microvm-run"])
 
         if File.exists?(runner_path) do
-          # Use the nix store path directly — don't copy, as runner scripts
-          # reference other nix store paths that would break if copied.
-          # The -o out_link is a GC root, keeping it alive.
-          real_path = resolve_symlinks(runner_path)
-          {:ok, real_path}
+          # Use the nix store path directly — runner scripts reference other
+          # nix store paths that would break if copied. The -o out_link is a
+          # GC root keeping it alive.
+          {:ok, resolve_symlinks(runner_path)}
         else
           {:error, "runner script not found at #{runner_path}"}
         end
 
-      {output, exit_code} ->
-        Logger.error("nix build failed (exit #{exit_code}): #{output}")
+      {:error, {:exit_code, code, output}} ->
+        Logger.error("nix build failed (exit #{code}): #{output}")
         {:error, "nix build failed: #{String.slice(output, 0, 500)}"}
+
+      {:error, reason} ->
+        Logger.error("nix build error: #{inspect(reason)}")
+        {:error, "nix build error: #{inspect(reason)}"}
     end
   end
 
