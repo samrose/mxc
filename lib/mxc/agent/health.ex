@@ -250,10 +250,9 @@ defmodule Mxc.Agent.Health do
   defp detect_system_memory_mb do
     case :os.type() do
       {:unix, :darwin} ->
-        case System.cmd("sysctl", ["-n", "hw.memsize"], stderr_to_stdout: true) do
-          {output, 0} ->
+        case Mxc.Subprocess.run([~c"sysctl", ~c"-n", ~c"hw.memsize"], timeout: 5_000) do
+          {:ok, output} ->
             output
-            |> String.trim()
             |> String.to_integer()
             |> div(1024 * 1024)
 

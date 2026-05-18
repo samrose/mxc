@@ -32,6 +32,12 @@ config :mxc, :api_token, "test-token"
 # Don't start Agent supervisor in tests (erlexec, auto-registration)
 config :mxc, :start_agent, false
 
+# Use mock backend for SystemdRunner tests — no real systemd needed
+config :mxc, :systemd_backend, Mxc.Agent.SystemdRunner.Backend.Mock
+
+# Use the project root as the flake source in SystemdRunner tests
+config :mxc, :flake_dir, Path.expand("..", __DIR__)
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 
