@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-flight runs on the same branch when a new push arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MIX_ENV: test
+  # Mix's color output works in GHA logs.
+  ELIXIR_ERL_OPTIONS: "+fnu"
+
+jobs:
+  # ─── Tier 1: pure Elixir + Mock backend ───────────────────────────────
+  # Covers ~95% of the codebase. No /dev/kvm, no microvm.host. Runs on
+  # the free ubuntu-24.04 x86_64 runner.
+  #
+  # Tier 2 (real systemctl, stub unit) and Tier 4 (real microVM via KVM)
+  # are tracked in ROADMAP.md as follow-up workflows.
+  test:
+    name: mix test (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      # All third-party actions are pinned to a full commit SHA, with the
+      # released tag in a trailing comment so Dependabot / Renovate can
+      # propose updates and humans can see what version is in use.
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          # Pull microvm.nix derivations from the public cachix substituter
+          # instead of rebuilding from source.
+          extra_nix_config: |
+            accept-flake-config = true
+            substituters = https://cache.nixos.org/ https://microvm.cachix.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= microvm.cachix.org-1:oXnBc6hRE3eX5rSYdRyMYXnfzcCxC7yKPTbZXALsqys=
+
+      - name: Mix deps & build cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ hashFiles('mix.lock', 'flake.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-
+
+      # First nix-develop call builds the dev shell; subsequent calls are
+      # near-instant thanks to the nix store cache.
+      - name: Warm dev shell
+        run: nix develop --command true
+
+      - name: Fetch Mix dependencies
+        run: nix develop --command mix deps.get
+
+      - name: Initialize PostgreSQL
+        run: nix develop --command just pg-init
+
+      - name: Start PostgreSQL
+        run: nix develop --command just pg-start
+
+      # `mix test` aliased to: ecto.create --quiet && ecto.migrate --quiet && test
+      # so migrations run automatically against the freshly-created mxc_test DB.
+      - name: Run test suite
+        run: nix develop --command mix test --color
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: nix develop --command just pg-stop || true
+
+      - name: Upload PostgreSQL log on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-log
+          path: .postgres/log
+          if-no-files-found: ignore
+          retention-days: 7

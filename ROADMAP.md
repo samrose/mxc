@@ -48,9 +48,11 @@ Living document. Update as work progresses.
 
 ### Test infra
 
-- [ ] `checks/integration.nix` — NixOS VM test that boots a real microVM via SystemdRunner and asserts state transitions reach the coordinator.
-- [ ] `.github/workflows/ci.yml` — GitHub Actions on `ubuntu-24.04` runs `nix flake check` (tier 4) + `mix test` (tier 1).
-- [ ] `just test-linux` — pushes test sources to the local linux-builder, runs `mix test --only linux_systemd` there.
+- [x] `.github/workflows/ci.yml` — GitHub Actions on `ubuntu-24.04` (x86_64) runs the tier-1 `mix test` suite via `nix develop`. Uses `cachix/install-nix-action` (no Determinate Systems) with all four actions pinned to commit SHAs. Caches Mix `deps`/`_build` via `actions/cache`; relies on the public `cache.nixos.org` + `microvm.cachix.org` substituters for the nix store (no per-run nix-store cache action). Uploads PostgreSQL logs on failure.
+- [ ] `.github/workflows/linux-systemd.yml` — adds a tier-2 job that installs the helper script + sudoers entry on the runner and exercises the `@tag :linux_systemd` tests against real systemctl with a stub `mxc-vm-test@.service` unit. **Depends on writing the @tag tests first.**
+- [ ] `checks/integration.nix` — NixOS VM test that boots a real microVM via SystemdRunner and asserts state transitions reach the coordinator. Tier-4. Needs `/dev/kvm` (GHA `ubuntu-24.04` provides it).
+- [ ] `.github/workflows/integration.yml` — runs `nix flake check` on a KVM-enabled runner to execute the NixOS VM test. Tier-4 wrapper.
+- [ ] `just test-linux` — pushes test sources to the local `nix.linux-builder` via SSH and runs `mix test --only linux_systemd` there. Local-dev counterpart to the tier-2 GHA job.
 
 ### Feature gaps from the audit (`~/.agent/diagrams/mxc-microvm-architecture.html`)
 
