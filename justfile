@@ -91,6 +91,31 @@ test-coverage:
 test-file file:
     mix test {{file}}
 
+# Run the @tag :linux_systemd integration tests against a remote linux-builder.
+# Requires MXC_BUILDER_HOST (and optionally MXC_BUILDER_PORT / MXC_BUILDER_USER)
+# to point at a Linux host where scripts/setup-linux-test-host.sh has been run.
+#
+# Example:
+#   MXC_BUILDER_HOST=builder.local just test-linux
+#   MXC_BUILDER_HOST=localhost MXC_BUILDER_PORT=31022 MXC_BUILDER_USER=builder just test-linux
+test-linux:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${MXC_BUILDER_HOST:?set MXC_BUILDER_HOST to your linux-builder hostname}"
+    port="${MXC_BUILDER_PORT:-22}"
+    user="${MXC_BUILDER_USER:-$(whoami)}"
+    remote_dir="${MXC_BUILDER_REMOTE_DIR:-mxc-linux-test}"
+    ssh_opts="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -p $port"
+    target="$user@$MXC_BUILDER_HOST"
+    echo "[test-linux] syncing sources to $target:$remote_dir"
+    rsync -az --delete \
+        --exclude=_build --exclude=deps --exclude=.postgres \
+        --exclude=.git --exclude=.elixir_ls \
+        -e "ssh $ssh_opts" \
+        ./ "$target:$remote_dir/"
+    echo "[test-linux] running tagged tests on $target"
+    ssh $ssh_opts "$target" "cd $remote_dir && nix develop -c mix deps.get && nix develop -c mix test --include linux_systemd"
+
 # ============================================================================
 # Code Quality
 # ============================================================================
