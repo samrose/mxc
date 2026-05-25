@@ -1,0 +1,17 @@
+[Unit]
+Description=mxc tier-2 test stub for microvm@%i
+# Stub unit template used by tier-2 integration tests
+# (test/mxc/agent/systemd_runner/backend/erlexec_test.exs). NOT a real
+# microvm.nix runner — installed only on hosts where we run @tag :linux_systemd
+# tests, in place of the upstream microvm.host template, so the orchestration
+# code path (helper script -> systemctl -> state transitions) can be
+# exercised without booting an actual VM.
+
+[Service]
+Type=simple
+ExecStart=/bin/sleep infinity
+Restart=no
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

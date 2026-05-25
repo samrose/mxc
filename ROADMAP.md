@@ -22,14 +22,15 @@ estimates: **XS** (< 1 day), **S** (1-3 days), **M** (1-2 weeks), **L** (multi-w
 
 **Goal:** prove the `Backend.Erlexec` path actually works. Today the SystemdRunner stack is merged but only exercised through the `Backend.Mock`. Until we run it against a real `systemctl`, every feature built on top inherits any unfound bug.
 
-| Item | Effort | Notes |
-|---|---|---|
-| `@tag :linux_systemd` integration tests | S | Couple of tests using a stub `mxc-vm-test@.service` unit (runs `sleep infinity`). Exercises the helper script + sudoers + real systemctl. |
-| `just test-linux` | XS | Ships test sources to local `nix.linux-builder` via SSH, runs `mix test --only linux_systemd`. Local-dev counterpart. |
-| `.github/workflows/linux-systemd.yml` | S | Tier-2 GHA job that installs the helper, configures sudoers, deploys the stub unit, runs the tagged tests. |
-| HelperPath via Nix derivation | XS | `pkgs.mxc-vm-helper` in the flake instead of expecting `/usr/local/bin/mxc-vm-helper`. Required for the GHA tier-2 job anyway. |
+| Item | Effort | Notes | Status |
+|---|---|---|---|
+| `@tag :linux_systemd` integration tests | S | 8 tests in `test/mxc/agent/systemd_runner/backend/erlexec_test.exs` covering create_state, set_flake, start_unit/unit_status, stop_unit, list_units against a stub `microvm@.service` unit. `build_runner` deliberately deferred to tier-4. | **In this PR** |
+| `scripts/setup-linux-test-host.sh` | XS | Idempotent host setup: installs helper, sudoers entry, stub unit, state dir. Has `--uninstall`. | **In this PR** |
+| `just test-linux` | XS | Pushes sources to a remote Linux host via rsync+SSH, runs `mix test --include linux_systemd` there. Configured via `MXC_BUILDER_HOST` env. | **In this PR** |
+| `.github/workflows/linux-systemd.yml` | S | Tier-2 GHA job that runs the setup script + the tagged tests on `ubuntu-24.04`. | Follow-up PR |
+| HelperPath via Nix derivation | XS | `pkgs.mxc-vm-helper` in the flake instead of expecting `/usr/local/bin/mxc-vm-helper`. | Follow-up PR |
 
-**Done when:** `MIX_RUN_LINUX_TESTS=1 mix test` is green on linux-builder, and the linux-systemd workflow is green in GHA.
+**Done when:** `mix test --include linux_systemd` is green on linux-builder, and the linux-systemd workflow is green in GHA.
 
 ---
 
