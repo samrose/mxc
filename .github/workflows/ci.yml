@@ -67,20 +67,36 @@ jobs:
       - name: Fetch Mix dependencies
         run: nix develop --command mix deps.get
 
-      - name: Initialize PostgreSQL
-        run: nix develop --command just pg-init
+      # The justfile's pg-init / pg-start work locally but silence createuser
+      # errors with `2>/dev/null || true` (idempotency for re-runs). We
+      # inline the commands here so any failure surfaces in the CI log.
+
+      - name: Initialize PostgreSQL data dir
+        run: nix develop --command bash -c 'mkdir -p .postgres && initdb -D .postgres/data --auth-local=trust --auth-host=trust && echo "unix_socket_directories = '"'"'$PWD/.postgres'"'"'" >> .postgres/data/postgresql.conf'
 
       - name: Start PostgreSQL
-        run: nix develop --command just pg-start
+        run: nix develop --command pg_ctl -D .postgres/data -l .postgres/log start
+
+      - name: Wait for PostgreSQL to accept connections
+        run: nix develop --command bash -c 'for i in $(seq 1 30); do pg_isready -h "$PWD/.postgres" -q && exit 0; sleep 1; done; echo "pg_isready timed out"; cat .postgres/log; exit 1'
+
+      - name: Create mxc role
+        run: nix develop --command createuser -h "$PWD/.postgres" mxc --superuser
+
+      - name: Create mxc_test database
+        run: nix develop --command createdb -h "$PWD/.postgres" mxc_test -O mxc
+
+      - name: Smoke-test the connection
+        run: nix develop --command psql -h "$PWD/.postgres" -U mxc -d mxc_test -c 'SELECT current_user, current_database();'
 
       # `mix test` aliased to: ecto.create --quiet && ecto.migrate --quiet && test
-      # so migrations run automatically against the freshly-created mxc_test DB.
+      # so migrations run automatically against the mxc_test DB.
       - name: Run test suite
         run: nix develop --command mix test --color
 
       - name: Stop PostgreSQL
         if: always()
-        run: nix develop --command just pg-stop || true
+        run: nix develop --command pg_ctl -D .postgres/data stop || true
 
       - name: Upload PostgreSQL log on failure
         if: failure()
